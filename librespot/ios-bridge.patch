@@ -56,21 +56,21 @@ index 0000000..66f917f
 +    }
 +}
 diff --git a/connect/src/spirc.rs b/connect/src/spirc.rs
-index e1b9707..3e441e8 100644
+index e1b9707..901f860 100644
 --- a/connect/src/spirc.rs
 +++ b/connect/src/spirc.rs
-@@ -42,6 +42,11 @@ use std::{
-     time::{Duration, SystemTime, UNIX_EPOCH},
- };
+@@ -44,6 +44,11 @@ use std::{
  use thiserror::Error;
-+
+ use tokio::{sync::mpsc, time::sleep};
+ 
 +/// connectbridge: how many times another Spotify device asked this one to pause. The pause that the
 +/// route guard issues goes through `SpircCommand::Pause`, not through here, so the guard can tell
 +/// a pause by a person from its own.
 +pub static REMOTE_PAUSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
- use tokio::{sync::mpsc, time::sleep};
- 
++
  #[derive(Debug, Error)]
+ enum SpircError {
+     #[error("response payload empty")]
 @@ -1140,7 +1145,10 @@ impl SpircTask {
  
                  self.connect_state.set_origin(play.play_origin)
@@ -124,8 +124,80 @@ index 64615ca..33bb800 100644
              "arm" | "aarch64" => Platform::PLATFORM_LINUX_ARM,
              "blackfin" => Platform::PLATFORM_LINUX_BLACKFIN,
              "mips" => Platform::PLATFORM_LINUX_MIPS,
+diff --git a/core/src/http_client.rs b/core/src/http_client.rs
+index 03af57e..fd594cb 100644
+--- a/core/src/http_client.rs
++++ b/core/src/http_client.rs
+@@ -1,5 +1,5 @@
+ use std::{
+-    sync::OnceLock,
++    sync::{Mutex, atomic::{AtomicU64, Ordering}},
+     time::{Duration, Instant},
+ };
+ 
+@@ -94,10 +94,21 @@ impl From<HttpClientError> for Error {
+ 
+ type HyperClient = Client<ProxyConnector<HttpsConnector<HttpConnector>>, Full<bytes::Bytes>>;
+ 
++/// connectbridge: bumped by `reset_connections`. Pooled connections can be dead without the
++/// client knowing (the process was suspended or the network changed under it, e.g. around a Siri
++/// interruption): a request on one then fails or hangs. Every client builds a fresh pool after it.
++static POOL_GENERATION: AtomicU64 = AtomicU64::new(0);
++
++/// Drops the pooled connections of every `HttpClient`: the next request opens new ones.
++pub fn reset_connections() {
++    POOL_GENERATION.fetch_add(1, Ordering::Relaxed);
++}
++
+ pub struct HttpClient {
+     user_agent: HeaderValue,
+     proxy_url: Option<Url>,
+-    hyper_client: OnceLock<HyperClient>,
++    // The generation it was built for: `reset_connections` makes the next request build a new one.
++    hyper_client: Mutex<(u64, Option<HyperClient>)>,
+ 
+     rate_limiter:
+         RateLimiter<String, DefaultKeyedStateStore<String>, MonotonicClock, NoOpMiddleware>,
+@@ -139,7 +150,7 @@ impl HttpClient {
+         Self {
+             user_agent,
+             proxy_url: proxy_url.cloned(),
+-            hyper_client: OnceLock::new(),
++            hyper_client: Mutex::new((0, None)),
+             rate_limiter,
+         }
+     }
+@@ -169,13 +180,25 @@ impl HttpClient {
+ 
+         let client = Client::builder(TokioExecutor::new())
+             .http2_adaptive_window(true)
++            // Find a dead connection within seconds instead of waiting for the TCP timeout.
++            .http2_keep_alive_interval(Duration::from_secs(10))
++            .http2_keep_alive_timeout(Duration::from_secs(5))
++            .http2_keep_alive_while_idle(true)
++            .pool_idle_timeout(Duration::from_secs(30))
+             .build(proxy_connector);
+         Ok(client)
+     }
+ 
+-    fn hyper_client(&self) -> &HyperClient {
+-        self.hyper_client
+-            .get_or_init(|| Self::try_create_hyper_client(self.proxy_url.as_ref()).unwrap())
++    fn hyper_client(&self) -> HyperClient {
++        let generation = POOL_GENERATION.load(Ordering::Relaxed);
++        let mut slot = self.hyper_client.lock().unwrap_or_else(|e| e.into_inner());
++        if slot.1.is_none() || slot.0 != generation {
++            *slot = (
++                generation,
++                Some(Self::try_create_hyper_client(self.proxy_url.as_ref()).unwrap()),
++            );
++        }
++        slot.1.clone().expect("client was just created")
+     }
+ 
+     pub async fn request(&self, req: Request<Bytes>) -> Result<Response<Incoming>, Error> {
 diff --git a/playback/src/audio_backend/mod.rs b/playback/src/audio_backend/mod.rs
-index f8f43e3..eefe1c9 100644
+index f8f43e3..206be6e 100644
 --- a/playback/src/audio_backend/mod.rs
 +++ b/playback/src/audio_backend/mod.rs
 @@ -30,6 +30,12 @@ pub trait Sink {
@@ -141,13 +213,39 @@ index f8f43e3..eefe1c9 100644
      fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()>;
  }
  
+@@ -109,6 +115,10 @@ use self::gstreamer::GstreamerSink;
+ mod rodio;
+ #[cfg(feature = "rodio-backend")]
+ use self::rodio::RodioSink;
++/// connectbridge: after an audio session interruption the open output stream is dead; the next
++/// write opens a new one.
++#[cfg(feature = "rodio-backend")]
++pub use self::rodio::request_output_reopen;
+ 
+ #[cfg(feature = "sdl-backend")]
+ mod sdl;
 diff --git a/playback/src/audio_backend/rodio.rs b/playback/src/audio_backend/rodio.rs
-index b6cd346..334e025 100644
+index b6cd346..8f6792d 100644
 --- a/playback/src/audio_backend/rodio.rs
 +++ b/playback/src/audio_backend/rodio.rs
-@@ -72,8 +72,12 @@ impl From<cpal::SupportedStreamConfigsError> for RodioError {
+@@ -1,4 +1,5 @@
+ use std::process::exit;
++use std::sync::atomic::{AtomicBool, Ordering};
+ use std::thread;
+ use std::time::Duration;
+ 
+@@ -71,9 +72,21 @@ impl From<cpal::SupportedStreamConfigsError> for RodioError {
+     }
  }
  
++/// connectbridge: the audio session was interrupted (Siri, ...) and has been reactivated. The output
++/// stream that was open before is dead and cpal does not revive it: the next use opens a new one.
++static REOPEN_OUTPUT: AtomicBool = AtomicBool::new(false);
++
++pub fn request_output_reopen() {
++    REOPEN_OUTPUT.store(true, Ordering::Relaxed);
++}
++
  pub struct RodioSink {
 -    rodio_sink: rodio::Sink,
 -    _stream: rodio::OutputStream,
@@ -160,7 +258,7 @@ index b6cd346..334e025 100644
  }
  
  fn list_formats(device: &cpal::Device) {
-@@ -219,24 +223,46 @@ pub fn open(host: cpal::Host, device: Option<String>, format: AudioFormat) -> Ro
+@@ -219,24 +232,53 @@ pub fn open(host: cpal::Host, device: Option<String>, format: AudioFormat) -> Ro
          host.id().name()
      );
  
@@ -180,6 +278,9 @@ index b6cd346..334e025 100644
 +
 +impl RodioSink {
 +    fn output(&mut self) -> SinkResult<&mut (rodio::Sink, rodio::OutputStream)> {
++        if REOPEN_OUTPUT.swap(false, Ordering::Relaxed) && self.output.take().is_some() {
++            debug!("Dropped the rodio output stream after an audio session interruption");
++        }
 +        if self.output.is_none() {
 +            debug!("Reopening the rodio output stream");
 +            let output = create_sink(&self.host, self.device.clone(), self.format)?;
@@ -200,7 +301,11 @@ index b6cd346..334e025 100644
 -        self.rodio_sink.sleep_until_end();
 -        self.rodio_sink.pause();
 +        if let Some((sink, _)) = self.output.as_ref() {
-+            sink.sleep_until_end();
++            // Not sleep_until_end(): on a dead output stream (audio session interruption) the
++            // queue never drains and that would block the player thread for ever.
++            while !sink.empty() && !REOPEN_OUTPUT.load(Ordering::Relaxed) {
++                thread::sleep(Duration::from_millis(10));
++            }
 +            sink.pause();
 +        }
 +        Ok(())
@@ -213,7 +318,7 @@ index b6cd346..334e025 100644
          Ok(())
      }
  
-@@ -250,12 +276,13 @@ impl Sink for RodioSink {
+@@ -250,12 +292,18 @@ impl Sink for RodioSink {
              SAMPLE_RATE,
              samples_f32,
          );
@@ -226,6 +331,11 @@ index b6cd346..334e025 100644
          // 44100 elements --> about 27 chunks
 -        while self.rodio_sink.len() > 26 {
 +        while sink.len() > 26 {
++            // A dead output stream (audio session interruption) never drains: give up waiting,
++            // the next write opens a new stream.
++            if REOPEN_OUTPUT.load(Ordering::Relaxed) {
++                break;
++            }
              // sleep and wait for rodio to drain a bit
              thread::sleep(Duration::from_millis(10));
          }
@@ -525,12 +635,15 @@ index 0000000..2be0ef7
 +}
 diff --git a/src/ios_audio_session.m b/src/ios_audio_session.m
 new file mode 100644
-index 0000000..64a136d
+index 0000000..64cb8f5
 --- /dev/null
 +++ b/src/ios_audio_session.m
-@@ -0,0 +1,219 @@
+@@ -0,0 +1,234 @@
 +#import <AVFoundation/AVFoundation.h>
 +#include <dlfcn.h>
++
++static void (*cb_interruption_ended)(void) = NULL;
++void cb_register_interruption_ended(void (*callback)(void)) { cb_interruption_ended = callback; }
 +
 +// connectbridge: cpal does not configure the AVAudioSession, so a bare CLI process stays silent.
 +void cb_activate_audio_session(void) {
@@ -546,15 +659,27 @@ index 0000000..64a136d
 +    }
 +    NSLog(@"librespot: audio session active, route=%@", [s.currentRoute.outputs valueForKey:@"portName"]);
 +
-+    // Another app (Siri starting Apple Music, a call, ...) can interrupt the session. cpal does not
-+    // restart its stream afterwards, so the player would block forever and Spotify Connect would
-+    // hang on "Connecting". The simplest reliable recovery is to exit and let connectbridged
-+    // start a fresh process once the interruption is over.
++    // Another app (Siri, a call, ...) can interrupt the session. cpal does not restart its stream
++    // afterwards. When the system says the interruption is resumable, the session is reactivated and
++    // the process is told (the output stream is opened anew, pooled connections are dropped), so
++    // the Spotify Connect session survives: a Siri "next" command arrives right after. Otherwise,
++    // or if reactivating fails, exit and let connectbridged start a fresh process.
 +    [[NSNotificationCenter defaultCenter] addObserverForName:AVAudioSessionInterruptionNotification object:nil queue:nil
 +        usingBlock:^(NSNotification *n) {
 +            AVAudioSessionInterruptionType type = [n.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
-+            NSLog(@"librespot: audio session interruption %@", type == AVAudioSessionInterruptionTypeBegan ? @"began" : @"ended");
++            AVAudioSessionInterruptionOptions options = [n.userInfo[AVAudioSessionInterruptionOptionKey] unsignedIntegerValue];
++            NSLog(@"librespot: audio session interruption %@ (options=0x%lx)",
++                  type == AVAudioSessionInterruptionTypeBegan ? @"began" : @"ended", (unsigned long)options);
 +            if (type == AVAudioSessionInterruptionTypeEnded) {
++                if ((options & AVAudioSessionInterruptionOptionShouldResume) && cb_interruption_ended) {
++                    NSError *resumeError = nil;
++                    if ([s setActive:YES error:&resumeError]) {
++                        NSLog(@"librespot: audio session resumed after the interruption");
++                        cb_interruption_ended();
++                        return;
++                    }
++                    NSLog(@"librespot: audio session reactivation failed: %@", resumeError);
++                }
 +                NSLog(@"librespot: restarting after the interruption");
 +                _exit(75);  // not exit(): this runs on a notification thread while the runtime is still running
 +            }
@@ -749,7 +874,7 @@ index 0000000..64a136d
 +        }];
 +}
 diff --git a/src/main.rs b/src/main.rs
-index 03cd358..22c6c6a 100644
+index 03cd358..a2bc774 100644
 --- a/src/main.rs
 +++ b/src/main.rs
 @@ -39,6 +39,12 @@ use tokio::sync::Semaphore;
@@ -765,13 +890,22 @@ index 03cd358..22c6c6a 100644
  use player_event_handler::{EventHandler, run_program_on_sink_events};
  
  fn device_id(name: &str) -> String {
-@@ -1907,11 +1913,75 @@ async fn set_env_var<K: AsRef<OsStr>, V: AsRef<OsStr>>(key: K, value: V) {
+@@ -1907,11 +1913,84 @@ async fn set_env_var<K: AsRef<OsStr>, V: AsRef<OsStr>>(key: K, value: V) {
      drop(permit);
  }
  
 +#[cfg(target_os = "ios")]
 +unsafe extern "C" {
 +    fn cb_activate_audio_session();
++    fn cb_register_interruption_ended(callback: extern "C" fn());
++}
++
++/// The audio session was interrupted and is active again: open a new output stream and new
++/// connections (the old ones may be dead; see `http_client::reset_connections`).
++#[cfg(target_os = "ios")]
++extern "C" fn on_interruption_ended() {
++    librespot::playback::audio_backend::request_output_reopen();
++    librespot::core::http_client::reset_connections();
 +}
 +
 +#[cfg(target_os = "ios")]
@@ -841,12 +975,13 @@ index 03cd358..22c6c6a 100644
      const DISCOVERY_RETRY_UPTIME_LIMIT: Duration = Duration::from_secs(60);
      const RECONNECT_RATE_LIMIT: usize = 5;
  
-@@ -1919,7 +1989,36 @@ async fn main() {
+@@ -1919,7 +1998,37 @@ async fn main() {
          set_env_var(RUST_BACKTRACE, "full").await;
      }
  
 +    #[cfg(target_os = "ios")]
 +    unsafe {
++        cb_register_interruption_ended(on_interruption_ended);
 +        cb_activate_audio_session();
 +    }
 +    if now_playing::enabled() {
@@ -878,7 +1013,7 @@ index 03cd358..22c6c6a 100644
  
      let mut last_credentials = None;
      let mut spirc: Option<Spirc> = None;
-@@ -2042,6 +2141,24 @@ async fn main() {
+@@ -2042,6 +2151,24 @@ async fn main() {
          (backend)(device, format)
      });
  
@@ -903,7 +1038,7 @@ index 03cd358..22c6c6a 100644
      if let Some(player_event_program) = setup.player_event_program.clone() {
          _event_handler = Some(EventHandler::new(
              player.get_player_event_channel(),
-@@ -2055,8 +2172,65 @@ async fn main() {
+@@ -2055,8 +2182,65 @@ async fn main() {
          }
      }
  
@@ -969,7 +1104,7 @@ index 03cd358..22c6c6a 100644
              credentials = async {
                  match discovery.as_mut() {
                      Some(d) => d.next().await,
-@@ -2122,6 +2296,12 @@ async fn main() {
+@@ -2122,6 +2306,12 @@ async fn main() {
  
                  warn!("Spirc shut down unexpectedly");
  
