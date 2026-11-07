@@ -984,7 +984,7 @@ index 03cd358..22c6c6a 100644
                      auto_connect_times.len() > RECONNECT_RATE_LIMIT
 diff --git a/src/now_playing.rs b/src/now_playing.rs
 new file mode 100644
-index 0000000..fd7eea6
+index 0000000..9f22fa9
 --- /dev/null
 +++ b/src/now_playing.rs
 @@ -0,0 +1,168 @@
@@ -1045,7 +1045,7 @@ index 0000000..fd7eea6
 +            _ => return,
 +        };
 +        log::debug!("now playing: remote command {command:?}");
-+        COMMANDS.lock().unwrap().push_back(command);
++        COMMANDS.lock().unwrap_or_else(|e| e.into_inner()).push_back(command);
 +    }
 +
 +    pub fn init() {
@@ -1055,13 +1055,13 @@ index 0000000..fd7eea6
 +    /// When another device takes over there is nothing of ours to show or control any more.
 +    pub fn set_active(active: bool) {
 +        if !active && enabled() {
-+            *PLAYING.lock().unwrap() = false;
++            *PLAYING.lock().unwrap_or_else(|e| e.into_inner()) = false;
 +            unsafe { cb_now_playing_clear() };
 +        }
 +    }
 +
 +    pub fn take_commands() -> Vec<RemoteCommand> {
-+        COMMANDS.lock().unwrap().drain(..).collect()
++        COMMANDS.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect()
 +    }
 +
 +    fn c(s: &str) -> CString {
@@ -1082,7 +1082,7 @@ index 0000000..fd7eea6
 +    }
 +
 +    fn set_state(state: i32, position_ms: u32) {
-+        *PLAYING.lock().unwrap() = state == 1;
++        *PLAYING.lock().unwrap_or_else(|e| e.into_inner()) = state == 1;
 +        unsafe { cb_now_playing_set_state(state, position_ms as f64 / 1000.0) };
 +    }
 +
@@ -1132,7 +1132,7 @@ index 0000000..fd7eea6
 +            PlayerEvent::Paused { position_ms, .. } => set_state(0, *position_ms),
 +            PlayerEvent::Seeked { position_ms, .. }
 +            | PlayerEvent::PositionCorrection { position_ms, .. } => {
-+                let playing = *PLAYING.lock().unwrap();
++                let playing = *PLAYING.lock().unwrap_or_else(|e| e.into_inner());
 +                set_state(if playing { 1 } else { 0 }, *position_ms);
 +            }
 +            PlayerEvent::Stopped { .. } | PlayerEvent::EndOfTrack { .. } => set_state(2, 0),
@@ -1158,7 +1158,7 @@ index 0000000..fd7eea6
 +pub use imp::{enabled, handle_event, init, set_active, take_commands};
 diff --git a/src/route_guard.rs b/src/route_guard.rs
 new file mode 100644
-index 0000000..27fa0ad
+index 0000000..2dfb85a
 --- /dev/null
 +++ b/src/route_guard.rs
 @@ -0,0 +1,173 @@
@@ -1237,7 +1237,7 @@ index 0000000..27fa0ad
 +    pub fn set_active(active: bool) {
 +        ACTIVE.store(active, Ordering::Relaxed);
 +        if !active {
-+            PAUSED_BY_GUARD.lock().unwrap().clear();
++            PAUSED_BY_GUARD.lock().unwrap_or_else(|e| e.into_inner()).clear();
 +            PLAYING.store(false, Ordering::Relaxed);
 +        }
 +        LEAKING.store(unsafe { cb_output_leaks() } != 0, Ordering::Relaxed);
@@ -1253,7 +1253,7 @@ index 0000000..27fa0ad
 +        // Not playing any more, even before the player's Paused event arrives: otherwise the next
 +        // tick sees "playing, output lost" and makes a new record by pausing again.
 +        PLAYING.store(false, Ordering::Relaxed);
-+        PAUSED_BY_GUARD.lock().unwrap().user_paused();
++        PAUSED_BY_GUARD.lock().unwrap_or_else(|e| e.into_inner()).user_paused();
 +    }
 +
 +    /// Is playback running (as far as the player events say)?
@@ -1268,12 +1268,12 @@ index 0000000..27fa0ad
 +                // Somebody (the user) started playback by hand: not ours to resume any more.
 +                // While the output is still muted this is not a decision about the resume (the
 +                // output is silent anyway), so the record stays.
-+                PAUSED_BY_GUARD.lock().unwrap().on_playing(muted());
++                PAUSED_BY_GUARD.lock().unwrap_or_else(|e| e.into_inner()).on_playing(muted());
 +            }
 +            PlayerEvent::Paused { .. } | PlayerEvent::Stopped { .. } => {
 +                PLAYING.store(false, Ordering::Relaxed);
 +                // The first one answers the guard's own pause; a later one is the user's.
-+                PAUSED_BY_GUARD.lock().unwrap().on_paused();
++                PAUSED_BY_GUARD.lock().unwrap_or_else(|e| e.into_inner()).on_paused();
 +            }
 +            _ => {}
 +        }
@@ -1286,7 +1286,7 @@ index 0000000..27fa0ad
 +        LEAKING.store(unsafe { cb_output_leaks() } != 0, Ordering::Relaxed);
 +        apply_mute();
 +
-+        let mut paused = PAUSED_BY_GUARD.lock().unwrap();
++        let mut paused = PAUSED_BY_GUARD.lock().unwrap_or_else(|e| e.into_inner());
 +        let had_record = paused.is_set();
 +        paused.check_remote(remote_pauses());
 +        if had_record && !paused.is_set() {
@@ -1385,7 +1385,7 @@ index 0000000..bde1f66
 +}
 diff --git a/src/volume_bridge.rs b/src/volume_bridge.rs
 new file mode 100644
-index 0000000..82a2012
+index 0000000..52ae450
 --- /dev/null
 +++ b/src/volume_bridge.rs
 @@ -0,0 +1,214 @@
@@ -1478,7 +1478,7 @@ index 0000000..82a2012
 +    }
 +
 +    fn with_bridge<R>(f: impl FnOnce(&mut Bridge) -> R) -> R {
-+        let mut guard = BRIDGE.lock().unwrap();
++        let mut guard = BRIDGE.lock().unwrap_or_else(|e| e.into_inner());
 +        let bridge = guard.get_or_insert_with(|| Bridge {
 +            logic: VolumeLogic::new(if managed() { READY_SETTLE_MS } else { 0 }),
 +            active_since: None,
@@ -1494,11 +1494,11 @@ index 0000000..82a2012
 +        use std::os::unix::fs::MetadataExt;
 +        static CACHE: std::sync::Mutex<Option<((u64, u64, i64, i64), bool)>> = std::sync::Mutex::new(None);
 +        let Ok(meta) = std::fs::metadata(path) else {
-+            *CACHE.lock().unwrap() = None;
++            *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 +            return false;
 +        };
 +        let identity = (meta.ino(), meta.len(), meta.mtime(), meta.mtime_nsec());
-+        let mut cache = CACHE.lock().unwrap();
++        let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
 +        if let Some((cached, ready)) = *cache {
 +            if cached == identity {
 +                return ready;
