@@ -871,11 +871,8 @@ static void releaseLeftoverRoute(void) {
     NSArray<NSDictionary *> *record = loadOwnership(&stale);
     if (!record) return;
     NSString *names = [[record valueForKey:@"name"] componentsJoinedByString:@", "];
-    if (![currentConfig()[@"ManageRoute"] boolValue]) {
-        cblog(@"route: ManageRoute is off, dropping the record of \"%@\"", names);
-        unlink(kHoldingPath.fileSystemRepresentation);
-        return;
-    }
+    // Whatever the settings say now: a route that was put on the device is given back (the release
+    // only touches the output while it still is that device).
     gOwned = record;
     cblog(@"route: the previous daemon did not release \"%@\", checking in 10s", names);
     gHolding = YES;
@@ -916,13 +913,32 @@ static void routeTick(void) {
             gReleaseInFlight = NO;
             gHolding = manage;
             if (manage) publishRouteReadiness(@"pending");  // until holdRoute has seen the output on the device
-            if (!manage && gOwned) forgetOwnership();  // ManageRoute was switched off: the old record is moot
-        } else if (gHolding) {
+            // Without ManageRoute nothing is held while Connect is selected; a record from before stays and
+            // is released when the selection ends.
+        } else if (gHolding || gOwned.count) {
+            gHolding = YES;  // the release below needs it, also when ManageRoute is off (the record is still owed)
             publishRouteReadiness(@"none");
             cblog(@"connect: not selected any more, releasing the route in %.0fs", delay);
             gReleaseAt = [NSDate dateWithTimeIntervalSinceNow:delay];
         } else {
             cblog(@"connect: not selected any more");
+        }
+    }
+
+    // The setting can change without this tick having seen the selection change (the restart that follows
+    // a change may be over within one tick): while Connect is selected, holding follows ManageRoute.
+    if (gActive && manage != gHolding) {
+        if (manage) {
+            cblog(@"route: ManageRoute is on, holding the route");
+            gReleaseAt = nil;
+            gReleaseAttempts = 0;
+            gReleaseGeneration++;
+            gReleaseInFlight = NO;
+            gHolding = YES;
+            publishRouteReadiness(@"pending");
+        } else {
+            cblog(@"route: ManageRoute is off, not holding the route any more");
+            gHolding = NO;  // gOwned and the marker stay: they are released when the selection ends
         }
     }
 

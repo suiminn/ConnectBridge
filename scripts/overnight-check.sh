@@ -33,9 +33,10 @@ snapshot() {
 		echo \"guard_events: \$(cnt 'route guard' $D/librespot.log)\"
 		echo \"interruptions: \$(cnt 'audio session interruption' $D/librespot.log)\"
 		echo \"authenticated: \$(cnt 'Authenticated as' $D/librespot.log)\"
-		echo \"volume_check_missed: \$(cnt 'volume check: MISSED' $D/librespot.log)\"
-		echo \"volume_check_extra: \$(cnt 'volume check: EXTRA' $D/librespot.log)\"
-		echo \"volume_check_summary: \$(grep 'volume check: changes' $D/librespot.log 2>/dev/null | tail -1 | sed 's/.*volume check: //')\"
+		# DEBUG lines of the volume bridge: they are only in the log while Verbose is on
+		echo \"volume_to_connect: \$(cnt 'volume bridge: route -> connect' $D/librespot.log)\"
+		echo \"volume_to_route: \$(cnt 'volume bridge: connect [0-9]* -> route' $D/librespot.log)\"
+		echo \"connection_lost: \$(cnt 'connection to Spotify lost' $D/librespot.log)\"
 		echo \"librespot_errors: \$(cnt ' ERROR ' $D/librespot.log)\"
 		echo \"daemon_log_bytes: \$(wc -c < $D/daemon.log)\"
 		echo \"librespot_log_bytes: \$(wc -c < $D/librespot.log)\"
@@ -52,6 +53,6 @@ cat "$FILE"
 if [[ "$MODE" == "after" && -e "$OUT/latest-before.txt" ]]; then
 	echo
 	echo "=== comparison with the evening snapshot ($(readlink "$OUT/latest-before.txt")) ==="
-	diff <(grep -E '^(proc|state|daemon_starts|librespot_starts|librespot_exits|strays_removed|route_|guard_|interruptions|authenticated|volume_check_|librespot_errors|daemon_log_bytes|librespot_log_bytes)' "$OUT/latest-before.txt") \
-	     <(grep -E '^(proc|state|daemon_starts|librespot_starts|librespot_exits|strays_removed|route_|guard_|interruptions|authenticated|volume_check_|librespot_errors|daemon_log_bytes|librespot_log_bytes)' "$OUT/latest-after.txt") || true
+	diff <(grep -E '^(proc|state|daemon_starts|librespot_starts|librespot_exits|strays_removed|route_|guard_|interruptions|authenticated|volume_|connection_|librespot_errors|daemon_log_bytes|librespot_log_bytes)' "$OUT/latest-before.txt") \
+	     <(grep -E '^(proc|state|daemon_starts|librespot_starts|librespot_exits|strays_removed|route_|guard_|interruptions|authenticated|volume_|connection_|librespot_errors|daemon_log_bytes|librespot_log_bytes)' "$OUT/latest-after.txt") || true
 fi

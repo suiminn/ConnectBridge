@@ -27,7 +27,7 @@
    ```
 2. Spotify の一覧に「`<AirPlay 機器> (via <iPhone>)`」が出るか確認する。
 3. 選んで再生し、HomePod から鳴るか確認する。
-4. **音量の通知の確認** (一晩のあいだ音量は変えていないので、通知が途切れていないかは、ここで初めて分かる): 再生中に、iPhone の音量ボタンで 3 回、HomePod 本体の操作で 3 回、音量を変える。1 分ほど待って、もう一度 `scripts/overnight-check.sh after <iPhone の IP>` を実行し、`volume_check_summary` を見る。
+4. **音量の同期の確認** (一晩のあいだ音量は変えていないので、KVO の通知が途切れていないかは、ここで初めて分かる): `Verbose` をオンにして、再生中に、iPhone の音量ボタンで 3 回、HomePod 本体の操作で 3 回、音量を変える。1 分ほど待って、もう一度 `scripts/overnight-check.sh after <iPhone の IP>` を実行し、`volume_to_connect` (HomePod 側 → Spotify) と `volume_to_route` (Spotify 側 → HomePod) が増えているのを見る。Spotify のスライダーが追従するかも、目で確かめる。
 
 ## 合格の基準
 
@@ -37,7 +37,8 @@
 | メモリ | `rss_kb` が大きく増えていない(目安: 倍にならない) |
 | 一覧 | 朝、Spotify の一覧にデバイスが出る |
 | 再生 | 選ぶと数秒で再生が始まり、HomePod から鳴る(iPhone 本体からは鳴らない) |
-| 音量の通知 | 朝の操作(上の手順 4)のあと、`volume_check_summary` の `changes` と `notifications` が同じだけ増え、`volume_check_missed` と `volume_check_extra` が 0 のまま (MediaRemote の音量通知が、一晩のあとも届く。これが通れば、ポーリングを通知に置き換える検討に進める) |
+| 音量の同期 | 朝の操作 (上の手順 4) のあと、HomePod 側と iPhone のボタンの操作のどちらでも Spotify のスライダーが追従し、`volume_to_connect` が増える (KVO の通知が、一晩のあとも届く。5 秒ごとの確認でも拾われるので、遅れて追従する場合は通知が止まっている) |
+| 接続の切断 | `connection_lost` が増えた場合は、その直後に `librespot_starts` も増え、`Authenticated as` が出ている (切断から自動で復旧している) |
 | ログ | `librespot_errors` が増えていない。`guard_events` / `interruptions` が不自然に増えていない |
 
 ## 失敗したときに見るもの
