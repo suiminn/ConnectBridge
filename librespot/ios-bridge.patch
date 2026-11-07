@@ -1,0 +1,2381 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 68fa2e1..450c140 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1732,8 +1732,6 @@ checksum = "f9fbbcab51052fe104eb5e5d351cf728d30a5be1fe14d9be8a3b097481fb97de"
+ [[package]]
+ name = "libmdns"
+ version = "0.10.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "a00dbe871d2cf9df13f68d152b949fca8cafc854b60ffd259fc6df6e8663d8d7"
+ dependencies = [
+  "byteorder",
+  "futures-util",
+@@ -1799,6 +1797,7 @@ dependencies = [
+ name = "librespot"
+ version = "0.8.0"
+ dependencies = [
++ "cc",
+  "data-encoding",
+  "env_logger",
+  "futures-util",
+diff --git a/Cargo.toml b/Cargo.toml
+index 241b269..3985252 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -151,6 +151,12 @@ librespot-oauth = { version = "0.8.0", path = "oauth", default-features = false
+ librespot-playback = { version = "0.8.0", path = "playback", default-features = false }
+ librespot-protocol = { version = "0.8.0", path = "protocol", default-features = false }
+ 
++[build-dependencies]
++cc = "1"
++
++[patch.crates-io]
++libmdns = { path = "../libmdns" }
++
+ [dependencies]
+ librespot-audio.workspace = true
+ librespot-connect.workspace = true
+diff --git a/build.rs b/build.rs
+new file mode 100644
+index 0000000..66f917f
+--- /dev/null
++++ b/build.rs
+@@ -0,0 +1,13 @@
++fn main() {
++    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("ios") {
++        cc::Build::new()
++            .file("src/ios_audio_session.m")
++            .flag("-fobjc-arc")
++            .compile("ios_audio_session");
++        println!("cargo:rustc-link-lib=framework=AVFoundation");
++        println!("cargo:rustc-link-lib=framework=Foundation");
++        println!("cargo:rustc-link-lib=framework=MediaPlayer");
++        println!("cargo:rustc-link-lib=framework=UIKit");
++        println!("cargo:rerun-if-changed=src/ios_audio_session.m");
++    }
++}
+diff --git a/connect/src/spirc.rs b/connect/src/spirc.rs
+index e1b9707..3e441e8 100644
+--- a/connect/src/spirc.rs
++++ b/connect/src/spirc.rs
+@@ -42,6 +42,11 @@ use std::{
+     time::{Duration, SystemTime, UNIX_EPOCH},
+ };
+ use thiserror::Error;
++
++/// connectbridge: how many times another Spotify device asked this one to pause. The pause that the
++/// route guard issues goes through `SpircCommand::Pause`, not through here, so the guard can tell
++/// a pause by a person from its own.
++pub static REMOTE_PAUSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+ use tokio::{sync::mpsc, time::sleep};
+ 
+ #[derive(Debug, Error)]
+@@ -1140,7 +1145,10 @@ impl SpircTask {
+ 
+                 self.connect_state.set_origin(play.play_origin)
+             }
+-            Pause(_) => self.handle_pause(),
++            Pause(_) => {
++                REMOTE_PAUSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                self.handle_pause()
++            }
+             SeekTo(seek_to) => {
+                 // for some reason the position is stored in value, not in position
+                 trace!("seek to {seek_to:?}");
+diff --git a/core/src/config.rs b/core/src/config.rs
+index 1b81123..f0306dc 100644
+--- a/core/src/config.rs
++++ b/core/src/config.rs
+@@ -11,7 +11,12 @@ pub(crate) const IOS_CLIENT_ID: &str = "58bd3c95768941ea9eb4350aaa033eb3";
+ // android or ios needs to be mocked, the `os_version` has to be set to a valid version.
+ // Otherwise, client-token or login5 requests will fail with a generic invalid-credential error.
+ /// See [std::env::consts::OS]
+-pub const OS: &str = std::env::consts::OS;
++// connectbridge: jailbroken iOS must present itself like the other desktop-class clients;
++// the iOS client id / platform make login5 and the APs answer with generic credential errors.
++pub const OS: &str = match std::env::consts::OS.as_bytes() {
++    b"ios" => "linux",
++    _ => std::env::consts::OS,
++};
+ 
+ // valid versions for some os:
+ // 'android': 30
+diff --git a/core/src/connection/handshake.rs b/core/src/connection/handshake.rs
+index 64615ca..33bb800 100644
+--- a/core/src/connection/handshake.rs
++++ b/core/src/connection/handshake.rs
+@@ -116,16 +116,13 @@ fn platform_for(os: &str, arch: &str) -> Platform {
+             "x86_64" => Platform::PLATFORM_FREEBSD_X86_64,
+             _ => Platform::PLATFORM_FREEBSD_X86,
+         },
+-        "ios" => match arch {
+-            "aarch64" => Platform::PLATFORM_IPHONE_ARM64,
+-            _ => Platform::PLATFORM_IPHONE_ARM,
+-        },
+         // Rather than sending `Platform::PLATFORM_ANDROID_ARM` for "android",
+         // we are spoofing "android" as "linux", as otherwise during Session::connect
+         // all APs will reject the client with TryAnotherAP, no matter the credentials
+         // used was obtained via OAuth using KEYMASTER or ANDROID's client ID or
+         // Login5Manager::login
+-        "linux" | "android" => match arch {
++        // Same for jailbroken iOS: PLATFORM_IPHONE_* makes the APs answer TryAnotherAP.
++        "linux" | "android" | "ios" => match arch {
+             "arm" | "aarch64" => Platform::PLATFORM_LINUX_ARM,
+             "blackfin" => Platform::PLATFORM_LINUX_BLACKFIN,
+             "mips" => Platform::PLATFORM_LINUX_MIPS,
+diff --git a/playback/src/audio_backend/mod.rs b/playback/src/audio_backend/mod.rs
+index f8f43e3..eefe1c9 100644
+--- a/playback/src/audio_backend/mod.rs
++++ b/playback/src/audio_backend/mod.rs
+@@ -30,6 +30,12 @@ pub trait Sink {
+     fn stop(&mut self) -> SinkResult<()> {
+         Ok(())
+     }
++    /// connectbridge: called after a stop that is not just the gap between two tracks (a pause,
++    /// the end of playback). The sink may give up its output stream so that the system no longer
++    /// sees an app that is playing; `start` opens it again.
++    fn release(&mut self) -> SinkResult<()> {
++        Ok(())
++    }
+     fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()>;
+ }
+ 
+diff --git a/playback/src/audio_backend/rodio.rs b/playback/src/audio_backend/rodio.rs
+index b6cd346..334e025 100644
+--- a/playback/src/audio_backend/rodio.rs
++++ b/playback/src/audio_backend/rodio.rs
+@@ -72,8 +72,12 @@ impl From<cpal::SupportedStreamConfigsError> for RodioError {
+ }
+ 
+ pub struct RodioSink {
+-    rodio_sink: rodio::Sink,
+-    _stream: rodio::OutputStream,
++    // None while released (paused / stopped): a running output stream makes the system report
++    // "playing" even when only silence is written.
++    output: Option<(rodio::Sink, rodio::OutputStream)>,
++    host: cpal::Host,
++    device: Option<String>,
++    format: AudioFormat,
+ }
+ 
+ fn list_formats(device: &cpal::Device) {
+@@ -219,24 +223,46 @@ pub fn open(host: cpal::Host, device: Option<String>, format: AudioFormat) -> Ro
+         host.id().name()
+     );
+ 
+-    let (sink, stream) = create_sink(&host, device, format).unwrap();
++    let (sink, stream) = create_sink(&host, device.clone(), format).unwrap();
+ 
+     debug!("Rodio sink was created");
+     RodioSink {
+-        rodio_sink: sink,
+-        _stream: stream,
++        output: Some((sink, stream)),
++        host,
++        device,
++        format,
++    }
++}
++
++impl RodioSink {
++    fn output(&mut self) -> SinkResult<&mut (rodio::Sink, rodio::OutputStream)> {
++        if self.output.is_none() {
++            debug!("Reopening the rodio output stream");
++            let output = create_sink(&self.host, self.device.clone(), self.format)?;
++            self.output = Some(output);
++        }
++        Ok(self.output.as_mut().expect("output was just created"))
+     }
+ }
+ 
+ impl Sink for RodioSink {
+     fn start(&mut self) -> SinkResult<()> {
+-        self.rodio_sink.play();
++        self.output()?.0.play();
+         Ok(())
+     }
+ 
+     fn stop(&mut self) -> SinkResult<()> {
+-        self.rodio_sink.sleep_until_end();
+-        self.rodio_sink.pause();
++        if let Some((sink, _)) = self.output.as_ref() {
++            sink.sleep_until_end();
++            sink.pause();
++        }
++        Ok(())
++    }
++
++    fn release(&mut self) -> SinkResult<()> {
++        if self.output.take().is_some() {
++            debug!("Released the rodio output stream");
++        }
+         Ok(())
+     }
+ 
+@@ -250,12 +276,13 @@ impl Sink for RodioSink {
+             SAMPLE_RATE,
+             samples_f32,
+         );
+-        self.rodio_sink.append(source);
++        let (sink, _) = self.output()?;
++        sink.append(source);
+ 
+         // Chunk sizes seem to be about 256 to 3000 ish items long.
+         // Assuming they're on average 1628 then a half second buffer is:
+         // 44100 elements --> about 27 chunks
+-        while self.rodio_sink.len() > 26 {
++        while sink.len() > 26 {
+             // sleep and wait for rodio to drain a bit
+             thread::sleep(Duration::from_millis(10));
+         }
+diff --git a/playback/src/mixer/softmixer.rs b/playback/src/mixer/softmixer.rs
+index 189fc15..13313c6 100644
+--- a/playback/src/mixer/softmixer.rs
++++ b/playback/src/mixer/softmixer.rs
+@@ -4,7 +4,11 @@ use super::{Mixer, MixerConfig};
+ use librespot_core::Error;
+ use portable_atomic::AtomicU64;
+ use std::sync::Arc;
+-use std::sync::atomic::Ordering;
++use std::sync::atomic::{AtomicBool, Ordering};
++
++/// connectbridge: set while the output would leave through the wrong device (the iPhone speaker
++/// after the AirPlay connection dropped). Silences the audio from the next packet on.
++pub static GUARD_MUTE: AtomicBool = AtomicBool::new(false);
+ 
+ #[derive(Clone)]
+ pub struct SoftMixer {
+@@ -37,7 +41,13 @@ impl Mixer for SoftMixer {
+     }
+ 
+     fn get_soft_volume(&self) -> Box<dyn VolumeGetter + Send> {
+-        Box::new(SoftVolume(self.volume.clone()))
++        // connectbridge: with CB_PASSTHROUGH_VOLUME set, the Connect volume is only reported
++        // (events / mixer state); the audio itself is not attenuated so that an external
++        // controller can apply it to the output device instead.
++        Box::new(SoftVolume(
++            self.volume.clone(),
++            std::env::var_os("CB_PASSTHROUGH_VOLUME").is_some(),
++        ))
+     }
+ }
+ 
+@@ -45,11 +55,17 @@ impl SoftMixer {
+     pub const NAME: &'static str = "softvol";
+ }
+ 
+-struct SoftVolume(Arc<AtomicU64>);
++struct SoftVolume(Arc<AtomicU64>, bool);
+ 
+ impl VolumeGetter for SoftVolume {
+     #[inline]
+     fn attenuation_factor(&self) -> f64 {
++        if GUARD_MUTE.load(Ordering::Relaxed) {
++            return 0.0;
++        }
++        if self.1 {
++            return 1.0;
++        }
+         f64::from_bits(self.0.load(Ordering::Relaxed))
+     }
+ }
+diff --git a/playback/src/player.rs b/playback/src/player.rs
+index 19ee182..aede7a7 100644
+--- a/playback/src/player.rs
++++ b/playback/src/player.rs
+@@ -493,6 +493,21 @@ impl Player {
+         let handle = thread::spawn(move || {
+             let player_id = PLAYER_COUNTER.fetch_add(1, Ordering::AcqRel);
+             debug!("new Player [{player_id}]");
++            // connectbridge: set the QoS of the player thread and say what it got (0x21 user-interactive, 0x19 user-initiated, 0x15 default, 0x11 utility, 0x09 background).
++            #[cfg(target_os = "ios")]
++            {
++                unsafe extern "C" {
++                    fn pthread_self() -> usize;
++                    fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
++                    fn pthread_get_qos_class_np(thread: usize, qos: *mut u32, relative_priority: *mut i32) -> i32;
++                }
++                // It did not inherit the level of the runtime thread (it came out as 0x15, the default):
++                // the decoder is what keeps the audio fed, so it gets the same level explicitly.
++                unsafe { pthread_set_qos_class_self_np(0x21, 0) };
++                let (mut qos, mut relative) = (0u32, 0i32);
++                let rc = unsafe { pthread_get_qos_class_np(pthread_self(), &mut qos, &mut relative) };
++                info!(target: "librespot::qos", "qos: player thread class=0x{qos:02x} relative={relative} (rc={rc})");
++            }
+ 
+             let converter = Converter::new(config.ditherer);
+             let normalisation_knee_factor = 1.0 / (8.0 * config.normalisation_knee_db);
+@@ -1655,6 +1670,11 @@ impl PlayerInternal {
+                         } else {
+                             SinkStatus::Closed
+                         };
++                        if !temporarily {
++                            if let Err(e) = self.sink.release() {
++                                warn!("could not release the sink: {e}");
++                            }
++                        }
+                         if let Some(callback) = &mut self.sink_event_callback {
+                             callback(self.sink_status);
+                         }
+@@ -1668,6 +1688,10 @@ impl PlayerInternal {
+             SinkStatus::TemporarilyClosed => {
+                 if !temporarily {
+                     self.sink_status = SinkStatus::Closed;
++                    // connectbridge: stopped while only paused for now: release the output too
++                    if let Err(e) = self.sink.release() {
++                        warn!("could not release the sink: {e}");
++                    }
+                     if let Some(callback) = &mut self.sink_event_callback {
+                         callback(SinkStatus::Closed);
+                     }
+diff --git a/src/guard_logic.rs b/src/guard_logic.rs
+new file mode 100644
+index 0000000..2be0ef7
+--- /dev/null
++++ b/src/guard_logic.rs
+@@ -0,0 +1,188 @@
++//! connectbridge: the "paused by the route guard" record, without any platform calls, so that it
++//! can be tested on a Mac (`scripts/test-daemon.sh` runs the tests below with `rustc --test`).
++//!
++//! The guard pauses playback when the AirPlay device is lost and resumes it when the device is
++//! back, unless somebody decided otherwise meanwhile. Who paused cannot be read from a
++//! `PlayerEvent`, so the people's pauses are reported where they come in:
++//! - `user_paused`: a local command (Now Playing pause, or play/pause while playing);
++//! - the remote pause counter (`librespot_connect::REMOTE_PAUSES`): another Spotify device paused.
++//!   The guard's own pause does not go through there.
++//! Either one, before or after the guard's pause was answered, cancels the resume.
++//!
++//! What cannot be identified: a pause that the player itself causes (end of the queue, an error).
++//! The first Paused event after the guard's pause is taken as the answer to it and keeps the
++//! record; a further one cancels it (the safe side: nothing starts playing on its own). A Playing
++//! event while the output is not muted is the user's too (while muted it is not a decision).
++
++#![allow(dead_code)]
++
++use std::time::{Duration, Instant};
++
++#[derive(Default)]
++pub struct GuardPause {
++    since: Option<Instant>,
++    answered: bool,
++    remote_pauses: u64,
++}
++
++impl GuardPause {
++    pub const fn new() -> Self {
++        GuardPause { since: None, answered: false, remote_pauses: 0 }
++    }
++
++    pub fn is_set(&self) -> bool {
++        self.since.is_some()
++    }
++
++    /// The guard is pausing playback now; `remote_pauses` is the counter at this moment.
++    pub fn guard_paused(&mut self, now: Instant, remote_pauses: u64) {
++        self.since = Some(now);
++        self.answered = false;
++        self.remote_pauses = remote_pauses;
++    }
++
++    /// A Paused / Stopped event from the player.
++    pub fn on_paused(&mut self) {
++        if self.since.is_none() {
++            return;
++        }
++        if self.answered {
++            self.since = None;
++        } else {
++            self.answered = true;
++        }
++    }
++
++    /// A Playing event from the player.
++    pub fn on_playing(&mut self, muted: bool) {
++        if !muted {
++            self.since = None;
++        }
++    }
++
++    /// A person paused or stopped here (local command).
++    pub fn user_paused(&mut self) {
++        self.since = None;
++    }
++
++    /// Another Spotify device paused since the guard did: the counter went up.
++    pub fn check_remote(&mut self, remote_pauses: u64) {
++        if self.since.is_some() && remote_pauses != self.remote_pauses {
++            self.since = None;
++        }
++    }
++
++    pub fn clear(&mut self) {
++        self.since = None;
++    }
++
++    /// The AirPlay device is back: should playback resume? Takes the record either way.
++    pub fn take_resume(&mut self, window: Duration, remote_pauses: u64) -> Option<bool> {
++        self.check_remote(remote_pauses);
++        self.since.take().map(|since| since.elapsed() <= window)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const WINDOW: Duration = Duration::from_secs(30);
++
++    fn paused_by_guard() -> GuardPause {
++        let mut g = GuardPause::default();
++        g.guard_paused(Instant::now(), 7);
++        g
++    }
++
++    #[test]
++    fn guard_pause_answered_then_back_resumes() {
++        let mut g = paused_by_guard();
++        g.on_paused(); // the guard's own pause arriving
++        assert!(g.is_set(), "the answer alone does not drop the record");
++        assert_eq!(g.take_resume(WINDOW, 7), Some(true));
++        assert_eq!(g.take_resume(WINDOW, 7), None);
++    }
++
++    #[test]
++    fn local_user_pause_before_the_answer_cancels() {
++        let mut g = paused_by_guard();
++        g.user_paused(); // before the guard's pause event arrives
++        g.on_paused(); // the guard's answer arrives afterwards
++        assert_eq!(g.take_resume(WINDOW, 7), None);
++    }
++
++    #[test]
++    fn remote_user_pause_before_the_answer_cancels() {
++        let mut g = paused_by_guard();
++        g.on_paused();
++        assert_eq!(g.take_resume(WINDOW, 8), None, "another device paused");
++        let mut g = paused_by_guard();
++        g.check_remote(8); // seen by the tick before the answer
++        g.on_paused();
++        assert_eq!(g.take_resume(WINDOW, 8), None);
++    }
++
++    #[test]
++    fn user_pause_after_the_answer_cancels() {
++        let mut g = paused_by_guard();
++        g.on_paused();
++        g.user_paused();
++        assert_eq!(g.take_resume(WINDOW, 7), None);
++        // A second Paused event that nothing explains also cancels (the safe side).
++        let mut g = paused_by_guard();
++        g.on_paused();
++        g.on_paused();
++        assert_eq!(g.take_resume(WINDOW, 7), None);
++    }
++
++    #[test]
++    fn user_play_then_pause_while_lost_cancels() {
++        let mut g = paused_by_guard();
++        g.on_paused();
++        g.on_playing(true); // play while muted: not a decision
++        assert!(g.is_set());
++        g.user_paused();
++        assert_eq!(g.take_resume(WINDOW, 7), None);
++    }
++
++    #[test]
++    fn play_after_the_device_is_back_cancels() {
++        let mut g = paused_by_guard();
++        g.on_paused();
++        g.on_playing(false);
++        assert_eq!(g.take_resume(WINDOW, 7), None);
++    }
++
++    #[test]
++    fn too_late_does_not_resume() {
++        let mut g = GuardPause::default();
++        g.guard_paused(Instant::now() - Duration::from_secs(31), 7);
++        assert_eq!(g.take_resume(WINDOW, 7), Some(false));
++    }
++
++    #[test]
++    fn events_without_a_record_do_nothing() {
++        let mut g = GuardPause::default();
++        g.on_paused();
++        g.on_playing(true);
++        g.user_paused();
++        g.check_remote(99);
++        assert!(!g.is_set());
++        assert_eq!(g.take_resume(WINDOW, 0), None);
++        // and a record made afterwards is not affected by what came before
++        g.guard_paused(Instant::now(), 99);
++        g.on_paused();
++        assert_eq!(g.take_resume(WINDOW, 99), Some(true));
++    }
++
++    #[test]
++    fn a_new_guard_pause_starts_over() {
++        let mut g = paused_by_guard();
++        g.on_paused();
++        g.on_paused(); // cancelled
++        g.guard_paused(Instant::now(), 7); // lost again later
++        g.on_paused();
++        assert!(g.is_set());
++    }
++}
+diff --git a/src/ios_audio_session.m b/src/ios_audio_session.m
+new file mode 100644
+index 0000000..64a136d
+--- /dev/null
++++ b/src/ios_audio_session.m
+@@ -0,0 +1,219 @@
++#import <AVFoundation/AVFoundation.h>
++#include <dlfcn.h>
++
++// connectbridge: cpal does not configure the AVAudioSession, so a bare CLI process stays silent.
++void cb_activate_audio_session(void) {
++    NSError *err = nil;
++    AVAudioSession *s = [AVAudioSession sharedInstance];
++    if (![s setCategory:AVAudioSessionCategoryPlayback error:&err]) {
++        NSLog(@"librespot: setCategory failed: %@", err);
++        return;
++    }
++    if (![s setActive:YES error:&err]) {
++        NSLog(@"librespot: setActive failed: %@", err);
++        return;
++    }
++    NSLog(@"librespot: audio session active, route=%@", [s.currentRoute.outputs valueForKey:@"portName"]);
++
++    // Another app (Siri starting Apple Music, a call, ...) can interrupt the session. cpal does not
++    // restart its stream afterwards, so the player would block forever and Spotify Connect would
++    // hang on "Connecting". The simplest reliable recovery is to exit and let connectbridged
++    // start a fresh process once the interruption is over.
++    [[NSNotificationCenter defaultCenter] addObserverForName:AVAudioSessionInterruptionNotification object:nil queue:nil
++        usingBlock:^(NSNotification *n) {
++            AVAudioSessionInterruptionType type = [n.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
++            NSLog(@"librespot: audio session interruption %@", type == AVAudioSessionInterruptionTypeBegan ? @"began" : @"ended");
++            if (type == AVAudioSessionInterruptionTypeEnded) {
++                NSLog(@"librespot: restarting after the interruption");
++                _exit(75);  // not exit(): this runs on a notification thread while the runtime is still running
++            }
++        }];
++    [[NSNotificationCenter defaultCenter] addObserverForName:AVAudioSessionMediaServicesWereResetNotification object:nil queue:nil
++        usingBlock:^(NSNotification *n) {
++            NSLog(@"librespot: media services were reset, restarting");
++            _exit(75);
++        }];
++}
++
++// --- system (output route) volume, used by the Connect <-> HomePod volume bridge ---
++@interface AVSystemController : NSObject
+++ (instancetype)sharedAVSystemController;
++- (BOOL)getVolume:(float *)v forCategory:(NSString *)c;
++- (BOOL)setVolumeTo:(float)v forCategory:(NSString *)c;
++@end
++
++// Private API: if this iOS does not have it, the volume bridge does nothing instead of crashing.
++static AVSystemController *cb_system_controller(void) {
++    Class cls = NSClassFromString(@"AVSystemController");
++    if (![cls respondsToSelector:@selector(sharedAVSystemController)]) return nil;
++    AVSystemController *sc = [cls sharedAVSystemController];
++    return ([sc respondsToSelector:@selector(getVolume:forCategory:)] && [sc respondsToSelector:@selector(setVolumeTo:forCategory:)]) ? sc : nil;
++}
++
++float cb_get_system_volume(void) {
++    AVSystemController *sc = cb_system_controller();
++    // Not the *active* category: it flips (e.g. to FindMyPhone) and reports unrelated volumes.
++    float v = -1;
++    if (!sc || ![sc getVolume:&v forCategory:@"Audio/Video"]) return -1;
++    return v;
++}
++
++void cb_set_system_volume(float v) {
++    AVSystemController *sc = cb_system_controller();
++    [sc setVolumeTo:v forCategory:@"Audio/Video"];
++}
++
++// "The route volume changed": the KVO of AVAudioSession.outputVolume (public API; it works on iOS 15.8
++// and on iPadOS 18.7, where MediaRemote's volume notification does not come). It can fire more than
++// once for one change. `fn` gets the new volume.
++typedef void (*cb_volume_fn)(float);
++
++@interface CBVolumeObserver : NSObject
++@property(nonatomic) cb_volume_fn fn;
++@end
++@implementation CBVolumeObserver
++- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
++    self.fn([change[NSKeyValueChangeNewKey] floatValue]);
++}
++@end
++
++void cb_watch_volume_notifications(cb_volume_fn fn) {
++    static CBVolumeObserver *observer;  // KVO does not retain its observer
++    observer = [CBVolumeObserver new];
++    observer.fn = fn;
++    [[AVAudioSession sharedInstance] addObserver:observer forKeyPath:@"outputVolume" options:NSKeyValueObservingOptionNew context:NULL];
++    NSLog(@"librespot: watching outputVolume (KVO)");
++}
++
++// --- Now Playing info and remote commands (HomePod shows / controls what the AirPlay source reports) ---
++#import <MediaPlayer/MediaPlayer.h>
++#import <UIKit/UIKit.h>
++
++typedef void (*cb_command_fn)(int command, double position_seconds);
++
++// MediaPlayer only works when its work runs on the main thread with a running run loop (a
++// dedicated thread with its own run loop is not enough). The Rust side therefore runs its
++// runtime on a second thread and hands the main thread to cb_run_main_loop().
++static NSMutableDictionary *gNowPlayingInfo;
++static NSString *gArtworkURL;
++
++@interface CBNowPlaying : NSObject
+++ (void)run:(dispatch_block_t)block;
++@end
++
++@implementation CBNowPlaying
+++ (void)run:(dispatch_block_t)block {
++    static dispatch_once_t once;
++    dispatch_once(&once, ^{ gNowPlayingInfo = [NSMutableDictionary dictionary]; });
++    dispatch_async(dispatch_get_main_queue(), block);
++}
++@end
++
++void cb_run_main_loop(void) {
++    [[NSRunLoop mainRunLoop] addPort:[NSMachPort port] forMode:NSDefaultRunLoopMode];
++    for (;;) {
++        @autoreleasepool {
++            [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate distantFuture]];
++        }
++    }
++}
++
++static void cb_publish_now_playing(void) {
++    [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo = [gNowPlayingInfo copy];
++}
++
++void cb_register_remote_commands(cb_command_fn fn) {
++    [CBNowPlaying run:^{
++        MPRemoteCommandCenter *center = [MPRemoteCommandCenter sharedCommandCenter];
++        void (^reg)(MPRemoteCommand *, int) = ^(MPRemoteCommand *command, int code) {
++            command.enabled = YES;
++            [command addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
++                fn(code, 0);
++                return MPRemoteCommandHandlerStatusSuccess;
++            }];
++        };
++        reg(center.playCommand, 1);
++        reg(center.pauseCommand, 2);
++        reg(center.togglePlayPauseCommand, 3);
++        reg(center.nextTrackCommand, 4);
++        reg(center.previousTrackCommand, 5);
++        center.changePlaybackPositionCommand.enabled = YES;
++        [center.changePlaybackPositionCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
++            fn(6, ((MPChangePlaybackPositionCommandEvent *)event).positionTime);
++            return MPRemoteCommandHandlerStatusSuccess;
++        }];
++        NSLog(@"librespot: remote commands registered");
++    }];
++}
++
++void cb_now_playing_set_track(const char *title, const char *artist, const char *album, double duration, const char *artwork_url) {
++    NSString *t = @(title), *a = @(artist), *al = @(album), *url = (artwork_url && *artwork_url) ? @(artwork_url) : nil;
++    [CBNowPlaying run:^{
++        [gNowPlayingInfo removeAllObjects];
++        gNowPlayingInfo[MPMediaItemPropertyTitle] = t;
++        gNowPlayingInfo[MPMediaItemPropertyArtist] = a;
++        gNowPlayingInfo[MPMediaItemPropertyAlbumTitle] = al;
++        gNowPlayingInfo[MPMediaItemPropertyPlaybackDuration] = @(duration);
++        gNowPlayingInfo[MPNowPlayingInfoPropertyElapsedPlaybackTime] = @0;
++        gNowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = @0;
++        gArtworkURL = url;
++        cb_publish_now_playing();
++        NSURL *artworkURL = url ? [NSURL URLWithString:url] : nil; if (!artworkURL) return;  // a nil URL throws
++        [[[NSURLSession sharedSession] dataTaskWithURL:artworkURL completionHandler:^(NSData *data, NSURLResponse *r, NSError *e) {
++            UIImage *image = data ? [UIImage imageWithData:data] : nil;
++            if (!image) return;
++            [CBNowPlaying run:^{
++                if (![gArtworkURL isEqualToString:url]) return;  // the track changed meanwhile
++                gNowPlayingInfo[MPMediaItemPropertyArtwork] =
++                    [[MPMediaItemArtwork alloc] initWithBoundsSize:image.size requestHandler:^UIImage *(CGSize size) { return image; }];
++                cb_publish_now_playing();
++            }];
++        }] resume];
++    }];
++}
++
++// state: 0 paused, 1 playing, 2 stopped
++void cb_now_playing_set_state(int state, double position) {
++    [CBNowPlaying run:^{
++        gNowPlayingInfo[MPNowPlayingInfoPropertyElapsedPlaybackTime] = @(position);
++        gNowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = @(state == 1 ? 1.0 : 0.0);
++        cb_publish_now_playing();
++        [MPNowPlayingInfoCenter defaultCenter].playbackState =
++            state == 1 ? MPNowPlayingPlaybackStatePlaying : state == 0 ? MPNowPlayingPlaybackStatePaused : MPNowPlayingPlaybackStateStopped;
++    }];
++}
++
++void cb_now_playing_clear(void) {
++    [CBNowPlaying run:^{
++        [gNowPlayingInfo removeAllObjects];
++        gArtworkURL = nil;
++        [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo = nil;
++        [MPNowPlayingInfoCenter defaultCenter].playbackState = MPNowPlayingPlaybackStateStopped;
++    }];
++}
++
++// --- output route guard: is the audio about to come out of the built-in speaker? ---
++
++typedef void (*cb_route_fn)(int leaking);
++
++static int cb_route_leaks(void) {
++    for (AVAudioSessionPortDescription *port in [AVAudioSession sharedInstance].currentRoute.outputs) {
++        if ([port.portType isEqualToString:AVAudioSessionPortBuiltInSpeaker] ||
++            [port.portType isEqualToString:AVAudioSessionPortBuiltInReceiver]) return 1;
++    }
++    return 0;
++}
++
++int cb_output_leaks(void) { return cb_route_leaks(); }
++
++void cb_watch_route(cb_route_fn fn) {
++    [[NSNotificationCenter defaultCenter] addObserverForName:AVAudioSessionRouteChangeNotification object:nil queue:nil
++        usingBlock:^(NSNotification *n) {
++            fn(cb_route_leaks());
++            NSMutableArray *ports = [NSMutableArray array];
++            for (AVAudioSessionPortDescription *port in [AVAudioSession sharedInstance].currentRoute.outputs) {
++                [ports addObject:[NSString stringWithFormat:@"%@ [%@]", port.portName, port.portType]];
++            }
++            NSLog(@"librespot: output route: %@", ports.count ? [ports componentsJoinedByString:@", "] : @"(none)");
++        }];
++}
+diff --git a/src/main.rs b/src/main.rs
+index 03cd358..bd2e206 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -39,6 +39,13 @@ use tokio::sync::Semaphore;
+ use url::Url;
+ 
+ mod player_event_handler;
++mod guard_logic;
++mod route_guard;
++mod session_state;
++mod now_playing;
++mod volume_bridge;
++mod notif_check;
++mod volume_logic;
+ use player_event_handler::{EventHandler, run_program_on_sink_events};
+ 
+ fn device_id(name: &str) -> String {
+@@ -1907,11 +1914,75 @@ async fn set_env_var<K: AsRef<OsStr>, V: AsRef<OsStr>>(key: K, value: V) {
+     drop(permit);
+ }
+ 
++#[cfg(target_os = "ios")]
++unsafe extern "C" {
++    fn cb_activate_audio_session();
++}
++
++#[cfg(target_os = "ios")]
++unsafe extern "C" {
++    fn cb_run_main_loop();
++    fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
++}
++
++// QOS_CLASS_USER_INTERACTIVE: the level of the foreground app. A background daemon at a lower
++// level is starved while the user works on the phone, and the audio stutters.
++#[cfg(target_os = "ios")]
++const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
++/// What the runtime thread got (class << 32 | relative priority) and the return codes (set << 32 | get).
++#[cfg(target_os = "ios")]
++static QOS_RUNTIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++#[cfg(target_os = "ios")]
++static QOS_RC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++// MediaPlayer (Now Playing, remote commands) needs the main thread to run a run loop, so on iOS
++// the runtime lives on a second thread.
++#[cfg(target_os = "ios")]
++fn main() {
++    std::thread::Builder::new()
++        .name("librespot".into())
++        .stack_size(8 * 1024 * 1024)
++        .spawn(|| {
++            // The player (decoder / sink) thread is created from this one and inherits the level.
++            let set_rc = unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
++            {
++                unsafe extern "C" {
++                    fn pthread_self() -> usize;
++                    fn pthread_get_qos_class_np(thread: usize, qos: *mut u32, relative_priority: *mut i32) -> i32;
++                }
++                let (mut qos, mut relative) = (0u32, 0i32);
++                let rc = unsafe { pthread_get_qos_class_np(pthread_self(), &mut qos, &mut relative) };
++                // logged once the logger is up (in run())
++                QOS_RUNTIME.store(((qos as u64) << 32) | (relative as u32 as u64), std::sync::atomic::Ordering::Relaxed);
++                QOS_RC.store(((set_rc as u32 as u64) << 32) | (rc as u32 as u64), std::sync::atomic::Ordering::Relaxed);
++            }
++            // connectbridge: the main thread only runs the run loop and would stay alive, unseen by
++            // connectbridged, if this thread died: leave the process so that it is started again.
++            let result = std::panic::catch_unwind(|| {
++                tokio::runtime::Builder::new_current_thread()
++                    .enable_all()
++                    .build()
++                    .expect("could not create the tokio runtime")
++                    .block_on(run())
++            });
++            exit(if result.is_ok() { 0 } else { 1 });
++        })
++        .expect("could not spawn the runtime thread");
++    unsafe { cb_run_main_loop() };
++}
++
++#[cfg(not(target_os = "ios"))]
+ #[tokio::main(flavor = "current_thread")]
+ async fn main() {
++    run().await
++}
++
++async fn run() {
+     const RUST_BACKTRACE: &str = "RUST_BACKTRACE";
+     const RECONNECT_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(600);
+     const DISCOVERY_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
++    // connectbridge: how long a closed session may wait for the Spirc task to end by itself.
++    const SESSION_LOST_GRACE: Duration = Duration::from_secs(5);
+     const DISCOVERY_RETRY_UPTIME_LIMIT: Duration = Duration::from_secs(60);
+     const RECONNECT_RATE_LIMIT: usize = 5;
+ 
+@@ -1919,7 +1990,36 @@ async fn main() {
+         set_env_var(RUST_BACKTRACE, "full").await;
+     }
+ 
++    #[cfg(target_os = "ios")]
++    unsafe {
++        cb_activate_audio_session();
++    }
++    if now_playing::enabled() {
++        now_playing::init();
++    }
++    if session_state::enabled() {
++        session_state::init();
++    }
++    if route_guard::enabled() {
++        route_guard::init();
++    }
++
+     let setup = get_setup().await;
++    #[cfg(target_os = "ios")]
++    {
++        // 0x21 user-interactive (the level of the foreground app), 0x19 user-initiated, 0x15 default
++        // (what a daemon gets), 0x11 utility, 0x09 background.
++        let qos = QOS_RUNTIME.load(std::sync::atomic::Ordering::Relaxed);
++        let rc = QOS_RC.load(std::sync::atomic::Ordering::Relaxed);
++        info!(
++            target: "librespot::qos",
++            "qos: runtime thread class=0x{:02x} relative={} (set rc={}, get rc={})",
++            (qos >> 32) as u32,
++            qos as u32 as i32,
++            (rc >> 32) as u32 as i32,
++            rc as u32 as i32
++        );
++    }
+ 
+     let mut last_credentials = None;
+     let mut spirc: Option<Spirc> = None;
+@@ -2042,6 +2142,24 @@ async fn main() {
+         (backend)(device, format)
+     });
+ 
++    if volume_bridge::enabled() || now_playing::enabled() || session_state::enabled() || route_guard::enabled() {
++        let mut events = player.get_player_event_channel();
++        std::thread::spawn(move || {
++            while let Some(event) = events.blocking_recv() {
++                session_state::handle_event(&event);
++                route_guard::handle_event(&event);
++                if volume_bridge::enabled() {
++                    if let librespot::playback::player::PlayerEvent::VolumeChanged { volume } = &event {
++                        volume_bridge::apply_connect_volume(*volume);
++                    }
++                }
++                if now_playing::enabled() {
++                    now_playing::handle_event(&event);
++                }
++            }
++        });
++    }
++
+     if let Some(player_event_program) = setup.player_event_program.clone() {
+         _event_handler = Some(EventHandler::new(
+             player.get_player_event_channel(),
+@@ -2055,8 +2173,65 @@ async fn main() {
+         }
+     }
+ 
++    let mut volume_tick = tokio::time::interval(Duration::from_millis(250));
++    volume_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
++
++    // connectbridge: when the connection to Spotify is lost, a fresh process is the dependable way
++    // back. The in-process reconnect can come very late (after the connection was closed at 04:55 the
++    // Spirc task only ended at 06:21, an hour and a half in which the device was gone from the Spotify
++    // list), and a Spirc recreated that way once took a selection without ever starting to play.
++    // connectbridged starts librespot again at once. `session_lost_since` is when the session was seen
++    // closed while the Spirc task was still running.
++    let mut session_watch = tokio::time::interval(Duration::from_secs(1));
++    session_watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
++    let mut session_lost_since: Option<Instant> = None;
++
+     loop {
+         tokio::select! {
++            _ = session_watch.tick(), if spirc_task.is_some() && !connecting => {
++                if session.is_invalid() {
++                    let since = *session_lost_since.get_or_insert_with(Instant::now);
++                    if since.elapsed() >= SESSION_LOST_GRACE {
++                        error!("connection to Spotify lost; exiting so that connectbridged starts a fresh librespot");
++                        exit(75);
++                    }
++                } else {
++                    session_lost_since = None;
++                }
++            },
++            _ = volume_tick.tick(), if (volume_bridge::enabled() || now_playing::enabled() || route_guard::enabled()) && spirc.is_some() && !connecting => {
++                if let Some(spirc) = spirc.as_ref() {
++                    route_guard::tick(spirc);
++                    if volume_bridge::enabled() {
++                        if let Some(volume) = volume_bridge::poll_external() {
++                            let result = spirc.set_volume(volume);
++                            if let Err(e) = &result {
++                                warn!("volume bridge: could not set connect volume: {e}");
++                            }
++                            volume_bridge::sent(result.is_ok());
++                        }
++                    }
++                    for command in now_playing::take_commands() {
++                        // A person's pause (also play/pause while playing) cancels the guard's resume.
++                        match command {
++                            now_playing::RemoteCommand::Pause => route_guard::user_paused(),
++                            now_playing::RemoteCommand::TogglePlayPause if route_guard::is_playing() => route_guard::user_paused(),
++                            _ => {}
++                        }
++                        let result = match command {
++                            now_playing::RemoteCommand::Play => spirc.play(),
++                            now_playing::RemoteCommand::Pause => spirc.pause(),
++                            now_playing::RemoteCommand::TogglePlayPause => spirc.play_pause(),
++                            now_playing::RemoteCommand::Next => spirc.next(),
++                            now_playing::RemoteCommand::Previous => spirc.prev(),
++                            now_playing::RemoteCommand::SeekMs(ms) => spirc.set_position_ms(ms),
++                        };
++                        if let Err(e) = result {
++                            warn!("now playing: remote command {command:?} failed: {e}");
++                        }
++                    }
++                }
++            },
+             credentials = async {
+                 match discovery.as_mut() {
+                     Some(d) => d.next().await,
+@@ -2122,6 +2297,12 @@ async fn main() {
+ 
+                 warn!("Spirc shut down unexpectedly");
+ 
++                // connectbridge: see session_watch above.
++                if cfg!(target_os = "ios") {
++                    error!("exiting so that connectbridged starts a fresh librespot");
++                    exit(75);
++                }
++
+                 let mut reconnect_exceeds_rate_limit = || {
+                     auto_connect_times.retain(|&t| t.elapsed() < RECONNECT_RATE_LIMIT_WINDOW);
+                     auto_connect_times.len() > RECONNECT_RATE_LIMIT
+diff --git a/src/notif_check.rs b/src/notif_check.rs
+new file mode 100644
+index 0000000..35fc9bc
+--- /dev/null
++++ b/src/notif_check.rs
+@@ -0,0 +1,231 @@
++//! connectbridge: compares the system volume polling with the KVO of `AVAudioSession.outputVolume`,
++//! without any platform calls, so that it
++//! can be tested on a Mac (`scripts/test-daemon.sh` runs the tests below with `rustc --test`).
++//!
++//! Observation only: nothing here changes what the volume bridge does. It answers whether the
++//! notification could replace the polling: every change that the polling sees should come with a
++//! notification (`missed` otherwise), and every notification with a change (`extra` otherwise).
++//! A change and a notification belong together when they are less than `WINDOW_MS` apart; the
++//! notification may come before the poll sees the change (up to one poll interval) or after it.
++
++#![allow(dead_code)]
++
++use std::collections::VecDeque;
++
++/// How far apart a change seen by the polling and its notification may be.
++pub const WINDOW_MS: u64 = 1000;
++/// Resolved entries are kept this long, for the entries on the other side that still need them.
++const KEEP_MS: u64 = 4 * WINDOW_MS;
++/// The volume is a float that the system rounds; smaller differences are not a change.
++const TOLERANCE: f32 = 0.0005;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Verdict {
++    /// The polling saw a change at this time and no notification came.
++    Missed(u64),
++    /// A notification came at this time and the polling saw no change.
++    Extra(u64),
++}
++
++struct Entry {
++    at: u64,
++    resolved: bool,
++}
++
++#[derive(Default)]
++pub struct NotifCheck {
++    last_raw: Option<f32>,
++    changes: VecDeque<Entry>,
++    notifs: VecDeque<Entry>,
++    pub changes_seen: u64,
++    pub notifs_seen: u64,
++    pub missed: u64,
++    pub extra: u64,
++}
++
++impl NotifCheck {
++    pub const fn new() -> Self {
++        NotifCheck {
++            last_raw: None,
++            changes: VecDeque::new(),
++            notifs: VecDeque::new(),
++            changes_seen: 0,
++            notifs_seen: 0,
++            missed: 0,
++            extra: 0,
++        }
++    }
++
++    pub fn on_notification(&mut self, now_ms: u64) {
++        self.notifs_seen += 1;
++        self.notifs.push_back(Entry { at: now_ms, resolved: false });
++    }
++
++    /// One reading of the system volume (`None`: it could not be read).
++    pub fn on_sample(&mut self, now_ms: u64, raw: Option<f32>) {
++        let Some(raw) = raw.filter(|v| *v >= 0.0) else {
++            self.last_raw = None; // unreadable: the next reading is a new start, not a change
++            return;
++        };
++        if self.last_raw.is_some_and(|last| (raw - last).abs() > TOLERANCE) {
++            self.changes_seen += 1;
++            self.changes.push_back(Entry { at: now_ms, resolved: false });
++        }
++        self.last_raw = Some(raw);
++    }
++
++    /// The volume cannot be compared now (the route is not the wanted one, or has only just become
++    /// so): forget the last reading and everything not yet decided. Changes and notifications that
++    /// come with a route switch are not the notification's doing.
++    pub fn pause(&mut self) {
++        self.last_raw = None;
++        self.changes.clear();
++        self.notifs.clear();
++    }
++
++    /// Decides what is old enough to be decided; call it after every sample.
++    pub fn tick(&mut self, now_ms: u64) -> Vec<Verdict> {
++        let mut verdicts = Vec::new();
++        let near = |a: u64, b: u64| a.abs_diff(b) <= WINDOW_MS;
++        for c in self.changes.iter_mut().filter(|c| !c.resolved && now_ms >= c.at + WINDOW_MS) {
++            c.resolved = true;
++            if !self.notifs.iter().any(|n| near(n.at, c.at)) {
++                self.missed += 1;
++                verdicts.push(Verdict::Missed(c.at));
++            }
++        }
++        for n in self.notifs.iter_mut().filter(|n| !n.resolved && now_ms >= n.at + WINDOW_MS) {
++            n.resolved = true;
++            if !self.changes.iter().any(|c| near(n.at, c.at)) {
++                self.extra += 1;
++                verdicts.push(Verdict::Extra(n.at));
++            }
++        }
++        while self.changes.front().is_some_and(|c| c.resolved && now_ms >= c.at + KEEP_MS) {
++            self.changes.pop_front();
++        }
++        while self.notifs.front().is_some_and(|n| n.resolved && now_ms >= n.at + KEEP_MS) {
++            self.notifs.pop_front();
++        }
++        verdicts
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Samples the volume every 250 ms from `from` to `to`; the volume steps to `v` at `step_at`.
++    fn run(check: &mut NotifCheck, from: u64, to: u64, step_at: Option<(u64, f32)>, start: f32) -> Vec<Verdict> {
++        let mut out = Vec::new();
++        let mut t = from;
++        while t <= to {
++            let v = match step_at {
++                Some((at, v)) if t >= at => v,
++                _ => start,
++            };
++            check.on_sample(t, Some(v));
++            out.extend(check.tick(t));
++            t += 250;
++        }
++        out
++    }
++
++    #[test]
++    fn change_with_a_notification_just_before_is_covered() {
++        let mut c = NotifCheck::new();
++        c.on_notification(5_000); // the poll sees the change up to one interval later
++        let out = run(&mut c, 0, 8_000, Some((5_100, 0.4)), 0.3);
++        assert!(out.is_empty());
++        assert_eq!((c.changes_seen, c.notifs_seen, c.missed, c.extra), (1, 1, 0, 0));
++    }
++
++    #[test]
++    fn change_with_a_notification_just_after_is_covered() {
++        let mut c = NotifCheck::new();
++        let mut out = run(&mut c, 0, 5_250, Some((5_000, 0.4)), 0.3);
++        c.on_notification(5_300);
++        out.extend(run(&mut c, 5_500, 9_000, Some((5_000, 0.4)), 0.3));
++        assert!(out.is_empty());
++        assert_eq!((c.missed, c.extra), (0, 0));
++    }
++
++    #[test]
++    fn change_without_a_notification_is_missed() {
++        let mut c = NotifCheck::new();
++        let out = run(&mut c, 0, 8_000, Some((5_000, 0.4)), 0.3);
++        assert_eq!(out, vec![Verdict::Missed(5_000)]);
++        assert_eq!(c.missed, 1);
++    }
++
++    #[test]
++    fn notification_without_a_change_is_extra() {
++        let mut c = NotifCheck::new();
++        c.on_notification(5_000);
++        let out = run(&mut c, 0, 8_000, None, 0.3);
++        assert_eq!(out, vec![Verdict::Extra(5_000)]);
++        assert_eq!(c.extra, 1);
++    }
++
++    #[test]
++    fn a_notification_far_from_the_change_does_not_cover_it() {
++        let mut c = NotifCheck::new();
++        c.on_notification(1_000);
++        let out = run(&mut c, 0, 12_000, Some((6_000, 0.4)), 0.3);
++        assert!(out.contains(&Verdict::Missed(6_000)));
++        assert!(out.contains(&Verdict::Extra(1_000)));
++    }
++
++    #[test]
++    fn several_steps_and_several_notifications() {
++        let mut c = NotifCheck::new();
++        let mut t = 0;
++        let mut v = 0.3;
++        let mut out = Vec::new();
++        while t <= 20_000 {
++            if t == 4_000 || t == 4_500 || t == 9_000 {
++                v += 0.05;
++                c.on_notification(t);
++            }
++            c.on_sample(t, Some(v));
++            out.extend(c.tick(t));
++            t += 250;
++        }
++        assert!(out.is_empty());
++        assert_eq!((c.changes_seen, c.notifs_seen), (3, 3));
++    }
++
++    #[test]
++    fn small_differences_and_unreadable_samples_are_not_changes() {
++        let mut c = NotifCheck::new();
++        c.on_sample(0, Some(0.3));
++        c.on_sample(250, Some(0.3002));
++        c.on_sample(500, None);
++        c.on_sample(750, Some(0.9)); // after an unreadable reading: a start, not a change
++        c.on_sample(1_000, Some(-1.0));
++        assert_eq!(c.changes_seen, 0);
++        assert!(c.tick(10_000).is_empty());
++    }
++
++    #[test]
++    fn pause_forgets_undecided_entries_and_the_last_reading() {
++        let mut c = NotifCheck::new();
++        c.on_sample(0, Some(0.3));
++        c.on_notification(100);
++        c.pause(); // route switch: the notification and the jump of the volume mean nothing
++        c.on_sample(250, Some(0.8)); // first reading after the pause is a start, not a change
++        assert!(c.tick(10_000).is_empty());
++        assert_eq!((c.missed, c.extra), (0, 0));
++    }
++
++    #[test]
++    fn resolved_entries_are_dropped_after_a_while() {
++        let mut c = NotifCheck::new();
++        c.on_notification(0);
++        c.on_sample(0, Some(0.3));
++        c.on_sample(250, Some(0.4));
++        c.tick(2_000);
++        c.tick(20_000);
++        assert!(c.changes.is_empty() && c.notifs.is_empty());
++    }
++}
+diff --git a/src/now_playing.rs b/src/now_playing.rs
+new file mode 100644
+index 0000000..fd7eea6
+--- /dev/null
++++ b/src/now_playing.rs
+@@ -0,0 +1,168 @@
++//! connectbridge: reports what is playing to the system (Now Playing) so that the AirPlay
++//! receiver (HomePod) can show it, and turns its remote commands into Spirc commands.
++
++use librespot::playback::player::PlayerEvent;
++
++#[derive(Clone, Copy, Debug)]
++pub enum RemoteCommand {
++    Play,
++    Pause,
++    TogglePlayPause,
++    Next,
++    Previous,
++    SeekMs(u32),
++}
++
++#[cfg(target_os = "ios")]
++mod imp {
++    use super::*;
++    use librespot::metadata::audio::UniqueFields;
++    use std::{
++        collections::VecDeque,
++        ffi::CString,
++        os::raw::{c_char, c_double, c_int},
++        sync::Mutex,
++    };
++
++    unsafe extern "C" {
++        fn cb_register_remote_commands(callback: extern "C" fn(c_int, c_double));
++        fn cb_now_playing_set_track(
++            title: *const c_char,
++            artist: *const c_char,
++            album: *const c_char,
++            duration: c_double,
++            artwork_url: *const c_char,
++        );
++        fn cb_now_playing_set_state(state: c_int, position: c_double);
++        fn cb_now_playing_clear();
++    }
++
++    static COMMANDS: Mutex<VecDeque<RemoteCommand>> = Mutex::new(VecDeque::new());
++    static PLAYING: Mutex<bool> = Mutex::new(false);
++
++    pub fn enabled() -> bool {
++        std::env::var_os("CB_NOW_PLAYING").is_some()
++    }
++
++    extern "C" fn on_command(code: c_int, position: c_double) {
++        let command = match code {
++            1 => RemoteCommand::Play,
++            2 => RemoteCommand::Pause,
++            3 => RemoteCommand::TogglePlayPause,
++            4 => RemoteCommand::Next,
++            5 => RemoteCommand::Previous,
++            6 => RemoteCommand::SeekMs((position.max(0.0) * 1000.0) as u32),
++            _ => return,
++        };
++        log::debug!("now playing: remote command {command:?}");
++        COMMANDS.lock().unwrap().push_back(command);
++    }
++
++    pub fn init() {
++        unsafe { cb_register_remote_commands(on_command) };
++    }
++
++    /// When another device takes over there is nothing of ours to show or control any more.
++    pub fn set_active(active: bool) {
++        if !active && enabled() {
++            *PLAYING.lock().unwrap() = false;
++            unsafe { cb_now_playing_clear() };
++        }
++    }
++
++    pub fn take_commands() -> Vec<RemoteCommand> {
++        COMMANDS.lock().unwrap().drain(..).collect()
++    }
++
++    fn c(s: &str) -> CString {
++        CString::new(s.replace('\0', "")).unwrap_or_default()
++    }
++
++    fn event_name(event: &PlayerEvent) -> &'static str {
++        match event {
++            PlayerEvent::TrackChanged { .. } => "TrackChanged",
++            PlayerEvent::Playing { .. } => "Playing",
++            PlayerEvent::Paused { .. } => "Paused",
++            PlayerEvent::Stopped { .. } => "Stopped",
++            PlayerEvent::EndOfTrack { .. } => "EndOfTrack",
++            PlayerEvent::Seeked { .. } => "Seeked",
++            PlayerEvent::Loading { .. } => "Loading",
++            _ => "other",
++        }
++    }
++
++    fn set_state(state: i32, position_ms: u32) {
++        *PLAYING.lock().unwrap() = state == 1;
++        unsafe { cb_now_playing_set_state(state, position_ms as f64 / 1000.0) };
++    }
++
++    pub fn handle_event(event: &PlayerEvent) {
++        match event {
++            PlayerEvent::TrackChanged { .. }
++            | PlayerEvent::Playing { .. }
++            | PlayerEvent::Paused { .. }
++            | PlayerEvent::Stopped { .. }
++            | PlayerEvent::EndOfTrack { .. }
++            | PlayerEvent::Seeked { .. }
++            | PlayerEvent::Loading { .. } => {
++                log::debug!("now playing: event {}", event_name(event));
++            }
++            _ => {}
++        }
++        match event {
++            PlayerEvent::TrackChanged { audio_item } => {
++                let (artist, album) = match &audio_item.unique_fields {
++                    UniqueFields::Track { artists, album, .. } => (
++                        artists.0.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", "),
++                        album.clone(),
++                    ),
++                    UniqueFields::Local { artists, album, .. } => {
++                        (artists.clone().unwrap_or_default(), album.clone().unwrap_or_default())
++                    }
++                    UniqueFields::Episode { show_name, .. } => (show_name.clone(), String::new()),
++                };
++                let cover = audio_item
++                    .covers
++                    .iter()
++                    .max_by_key(|cover| cover.width)
++                    .map(|cover| cover.url.as_str())
++                    .unwrap_or("");
++                log::debug!("now playing: {} / {artist} / {album}", audio_item.name);
++                unsafe {
++                    cb_now_playing_set_track(
++                        c(&audio_item.name).as_ptr(),
++                        c(&artist).as_ptr(),
++                        c(&album).as_ptr(),
++                        audio_item.duration_ms as f64 / 1000.0,
++                        c(cover).as_ptr(),
++                    )
++                };
++            }
++            PlayerEvent::Playing { position_ms, .. } => set_state(1, *position_ms),
++            PlayerEvent::Paused { position_ms, .. } => set_state(0, *position_ms),
++            PlayerEvent::Seeked { position_ms, .. }
++            | PlayerEvent::PositionCorrection { position_ms, .. } => {
++                let playing = *PLAYING.lock().unwrap();
++                set_state(if playing { 1 } else { 0 }, *position_ms);
++            }
++            PlayerEvent::Stopped { .. } | PlayerEvent::EndOfTrack { .. } => set_state(2, 0),
++            _ => {}
++        }
++    }
++}
++
++#[cfg(not(target_os = "ios"))]
++mod imp {
++    use super::*;
++    pub fn enabled() -> bool {
++        false
++    }
++    pub fn init() {}
++    pub fn set_active(_active: bool) {}
++    pub fn take_commands() -> Vec<RemoteCommand> {
++        Vec::new()
++    }
++    pub fn handle_event(_event: &PlayerEvent) {}
++}
++
++pub use imp::{enabled, handle_event, init, set_active, take_commands};
+diff --git a/src/route_guard.rs b/src/route_guard.rs
+new file mode 100644
+index 0000000..27fa0ad
+--- /dev/null
++++ b/src/route_guard.rs
+@@ -0,0 +1,173 @@
++//! connectbridge: keeps the audio from coming out of the iPhone speaker.
++//!
++//! AirPlay connections drop now and then; the system then moves the output to the built-in
++//! speaker. While this device is the active Connect device and the output is required to be the
++//! AirPlay device (`CB_REQUIRE_AIRPLAY`), the audio is silenced the moment the route changes to the
++//! built-in speaker, playback is paused, and it resumes once the route is back (within
++//! `CB_GUARD_RESUME_SECS`, default 30). `connectbridged` selects the AirPlay device again.
++
++#[cfg(target_os = "ios")]
++mod imp {
++    use librespot::{
++        connect::Spirc,
++        playback::{mixer::softmixer::GUARD_MUTE, player::PlayerEvent},
++    };
++    use crate::guard_logic::GuardPause;
++    use std::{
++        os::raw::c_int,
++        sync::{
++            Mutex,
++            atomic::{AtomicBool, Ordering},
++        },
++        time::{Duration, Instant},
++    };
++
++    unsafe extern "C" {
++        fn cb_output_leaks() -> c_int;
++        fn cb_watch_route(callback: extern "C" fn(c_int));
++    }
++
++    static ACTIVE: AtomicBool = AtomicBool::new(false);
++    static LEAKING: AtomicBool = AtomicBool::new(false);
++    static PLAYING: AtomicBool = AtomicBool::new(false);
++    static PAUSED_BY_GUARD: Mutex<GuardPause> = Mutex::new(GuardPause::new());
++
++    pub fn enabled() -> bool {
++        std::env::var_os("CB_REQUIRE_AIRPLAY").is_some()
++    }
++
++    fn resume_window() -> Duration {
++        let secs = std::env::var("CB_GUARD_RESUME_SECS")
++            .ok()
++            .and_then(|v| v.parse().ok())
++            .unwrap_or(30);
++        Duration::from_secs(secs)
++    }
++
++    fn muted() -> bool {
++        enabled() && ACTIVE.load(Ordering::Relaxed) && LEAKING.load(Ordering::Relaxed)
++    }
++
++    fn apply_mute() {
++        GUARD_MUTE.store(muted(), Ordering::Relaxed);
++    }
++
++    // Called by the system on every route change, on whatever thread: mute at once.
++    extern "C" fn on_route_change(leaking: c_int) {
++        LEAKING.store(leaking != 0, Ordering::Relaxed);
++        apply_mute();
++    }
++
++    pub fn init() {
++        unsafe {
++            cb_watch_route(on_route_change);
++            LEAKING.store(cb_output_leaks() != 0, Ordering::Relaxed);
++        }
++    }
++
++    /// Is the audio output (right now) the built-in speaker / receiver?
++    pub fn output_leaks() -> bool {
++        unsafe { cb_output_leaks() != 0 }
++    }
++
++    pub fn set_active(active: bool) {
++        ACTIVE.store(active, Ordering::Relaxed);
++        if !active {
++            PAUSED_BY_GUARD.lock().unwrap().clear();
++            PLAYING.store(false, Ordering::Relaxed);
++        }
++        LEAKING.store(unsafe { cb_output_leaks() } != 0, Ordering::Relaxed);
++        apply_mute();
++    }
++
++    fn remote_pauses() -> u64 {
++        librespot::connect::REMOTE_PAUSES.load(Ordering::Relaxed)
++    }
++
++    /// A person paused or stopped playback here (a Now Playing command).
++    pub fn user_paused() {
++        // Not playing any more, even before the player's Paused event arrives: otherwise the next
++        // tick sees "playing, output lost" and makes a new record by pausing again.
++        PLAYING.store(false, Ordering::Relaxed);
++        PAUSED_BY_GUARD.lock().unwrap().user_paused();
++    }
++
++    /// Is playback running (as far as the player events say)?
++    pub fn is_playing() -> bool {
++        PLAYING.load(Ordering::Relaxed)
++    }
++
++    pub fn handle_event(event: &PlayerEvent) {
++        match event {
++            PlayerEvent::Playing { .. } => {
++                PLAYING.store(true, Ordering::Relaxed);
++                // Somebody (the user) started playback by hand: not ours to resume any more.
++                // While the output is still muted this is not a decision about the resume (the
++                // output is silent anyway), so the record stays.
++                PAUSED_BY_GUARD.lock().unwrap().on_playing(muted());
++            }
++            PlayerEvent::Paused { .. } | PlayerEvent::Stopped { .. } => {
++                PLAYING.store(false, Ordering::Relaxed);
++                // The first one answers the guard's own pause; a later one is the user's.
++                PAUSED_BY_GUARD.lock().unwrap().on_paused();
++            }
++            _ => {}
++        }
++    }
++
++    pub fn tick(spirc: &Spirc) {
++        if !enabled() {
++            return;
++        }
++        LEAKING.store(unsafe { cb_output_leaks() } != 0, Ordering::Relaxed);
++        apply_mute();
++
++        let mut paused = PAUSED_BY_GUARD.lock().unwrap();
++        let had_record = paused.is_set();
++        paused.check_remote(remote_pauses());
++        if had_record && !paused.is_set() {
++            PLAYING.store(false, Ordering::Relaxed);  // another device paused: same as above
++        }
++        if muted() {
++            if !paused.is_set() && PLAYING.load(Ordering::Relaxed) {
++                log::warn!("route guard: the output left the AirPlay device, pausing");
++                paused.guard_paused(Instant::now(), remote_pauses());
++                drop(paused);
++                if let Err(e) = spirc.pause() {
++                    log::warn!("route guard: could not pause: {e}");
++                }
++            }
++        } else if let Some(in_time) = paused.take_resume(resume_window(), remote_pauses()) {
++            drop(paused);
++            if in_time {
++                log::warn!("route guard: the AirPlay device is back, resuming");
++                if let Err(e) = spirc.play() {
++                    log::warn!("route guard: could not resume: {e}");
++                }
++            } else {
++                log::warn!("route guard: the AirPlay device came back too late, staying paused");
++            }
++        }
++    }
++}
++
++#[cfg(not(target_os = "ios"))]
++mod imp {
++    use librespot::{connect::Spirc, playback::player::PlayerEvent};
++    pub fn enabled() -> bool {
++        false
++    }
++    pub fn init() {}
++    pub fn output_leaks() -> bool {
++        false
++    }
++    pub fn set_active(_active: bool) {}
++    pub fn user_paused() {}
++    pub fn is_playing() -> bool {
++        false
++    }
++    pub fn handle_event(_event: &PlayerEvent) {}
++    pub fn tick(_spirc: &Spirc) {}
++}
++
++pub use imp::{enabled, handle_event, init, is_playing, output_leaks, set_active, tick, user_paused};
+diff --git a/src/session_state.rs b/src/session_state.rs
+new file mode 100644
+index 0000000..bde1f66
+--- /dev/null
++++ b/src/session_state.rs
+@@ -0,0 +1,42 @@
++//! connectbridge: tells the supervisor (connectbridged) whether this device is the active Spotify
++//! Connect device, so the output route is only held while somebody has selected it.
++//!
++//! `SessionConnected` is emitted when this device becomes the active device (a transfer or a
++//! direct play), `SessionDisconnected` when playback moves to another device or the session ends.
++//! The state is written to the file named by `CB_STATE_FILE` ("active" or "inactive").
++
++use librespot::playback::player::PlayerEvent;
++use std::{fs, path::PathBuf};
++
++fn path() -> Option<PathBuf> {
++    std::env::var_os("CB_STATE_FILE").map(PathBuf::from)
++}
++
++pub fn enabled() -> bool {
++    path().is_some()
++}
++
++fn write(state: &str) {
++    let Some(path) = path() else { return };
++    let tmp = path.with_extension("tmp");
++    if fs::write(&tmp, state).and_then(|_| fs::rename(&tmp, &path)).is_err() {
++        log::warn!("session state: could not write {}", path.display());
++    }
++}
++
++pub fn init() {
++    write("inactive");
++}
++
++pub fn handle_event(event: &PlayerEvent) {
++    let active = match event {
++        PlayerEvent::SessionConnected { .. } => true,
++        PlayerEvent::SessionDisconnected { .. } => false,
++        _ => return,
++    };
++    log::debug!("session state: {}", if active { "active" } else { "inactive" });
++    crate::volume_bridge::set_active(active);
++    crate::now_playing::set_active(active);
++    crate::route_guard::set_active(active);
++    write(if active { "active" } else { "inactive" });
++}
+diff --git a/src/volume_bridge.rs b/src/volume_bridge.rs
+new file mode 100644
+index 0000000..2aacbf9
+--- /dev/null
++++ b/src/volume_bridge.rs
+@@ -0,0 +1,277 @@
++//! connectbridge: keeps the Spotify Connect volume and the output route (HomePod) volume in sync.
++//!
++//! Connect -> route: every `VolumeChanged` player event is applied to the system volume.
++//! Route -> Connect: the system volume is polled (with CB_VOLUME_NOTIFY: when the KVO says so, plus a slow safety poll); a change that we did not cause (outside the
++//! settle window and beyond the tolerance of the last value we applied) is sent to Spirc.
++//!
++//! Every time this device becomes the active Connect device the volume of the output route wins:
++//! once the wanted AirPlay device really is the system output, its volume is sent to Connect once,
++//! even when it did not change. Whenever it is not (the route is lost, or being switched), nothing
++//! is read from or written to the system volume until it is again and has been for a moment; then
++//! the volume is synced again. The rules are in `volume_logic.rs`, which has no platform calls.
++//!
++//! "The wanted device is the output" is told by connectbridged through the file named by
++//! `CB_ROUTE_FILE` ("ready" / "pending" / "none"; it is the one that selects the device and can
++//! see the output). It is read every time: a missing or unreadable file counts as not ready.
++//! Without that variable (route not managed) the activation grace is used.
++
++#[cfg(target_os = "ios")]
++mod imp {
++    use crate::{
++        notif_check::{NotifCheck, Verdict},
++        volume_logic::VolumeLogic,
++    };
++    use std::{
++        sync::{
++            Mutex, OnceLock,
++            atomic::{AtomicBool, Ordering},
++        },
++        time::{Duration, Instant},
++    };
++
++    unsafe extern "C" {
++        fn cb_get_system_volume() -> f32;
++        fn cb_set_system_volume(v: f32);
++        fn cb_watch_volume_notifications(callback: extern "C" fn(f32));
++    }
++
++    // CB_VOLUME_NOTIF_CHECK: compare the polling with the outputVolume KVO (observation
++    // only, see notif_check.rs). Its own lock: the notification arrives on another thread.
++    static CHECK: Mutex<NotifCheck> = Mutex::new(NotifCheck::new());
++    /// (time, counters) of the last summary line: it is written when the counters changed, at most this often.
++    static LAST_SUMMARY: Mutex<(u64, [u64; 4])> = Mutex::new((0, [0; 4]));
++    const SUMMARY_EVERY_MS: u64 = 30 * 1000;
++
++    /// CB_VOLUME_NOTIFY: no polling of the route volume. It is read when the system says it changed (KVO of outputVolume)
++    /// (`NOTIFIED`) or when `VolumeLogic::needs_poll` says a look is due. Without the variable the
++    /// volume is polled on every tick, as before.
++    static NOTIFIED: AtomicBool = AtomicBool::new(false);
++
++    fn notify_mode() -> bool {
++        static ON: OnceLock<bool> = OnceLock::new();
++        *ON.get_or_init(|| std::env::var_os("CB_VOLUME_NOTIFY").is_some())
++    }
++
++    fn check_enabled() -> bool {
++        static ON: OnceLock<bool> = OnceLock::new();
++        *ON.get_or_init(|| std::env::var_os("CB_VOLUME_NOTIF_CHECK").is_some())
++    }
++
++    /// Starts listening once, if either mode needs the notification.
++    fn start_notifications() {
++        static STARTED: OnceLock<()> = OnceLock::new();
++        STARTED.get_or_init(|| {
++            if notify_mode() || check_enabled() {
++                unsafe { cb_watch_volume_notifications(on_volume_notification) };
++            }
++        });
++    }
++
++    /// KVO of AVAudioSession.outputVolume: the route volume changed (it may fire more than once for one change).
++    extern "C" fn on_volume_notification(_volume: f32) {
++        NOTIFIED.store(true, Ordering::Release);
++        if check_enabled() {
++            CHECK.lock().unwrap().on_notification(now_ms());
++        }
++    }
++
++    /// The check starts this long after the route became ready: the system volume (and its
++    /// notification) follows the output with a delay.
++    const CHECK_SETTLE_MS: u64 = 2_000;
++    static CHECK_READY_SINCE: Mutex<Option<u64>> = Mutex::new(None);
++
++    /// Called on every poll tick; `ready`: the wanted device is the output.
++    fn check_sample(ready: bool) {
++        start_notifications();
++        if !check_enabled() {
++            return;
++        }
++        let now = now_ms();
++        let since = {
++            let mut s = CHECK_READY_SINCE.lock().unwrap();
++            if !ready {
++                *s = None;
++            } else if s.is_none() {
++                *s = Some(now);
++            }
++            *s
++        };
++        if since.is_none_or(|t| now < t + CHECK_SETTLE_MS) {
++            CHECK.lock().unwrap().pause();
++            return;
++        }
++        let raw = unsafe { cb_get_system_volume() };
++        let mut check = CHECK.lock().unwrap();
++        check.on_sample(now, Some(raw));
++        for verdict in check.tick(now) {
++            match verdict {
++                Verdict::Missed(at) => log::warn!("volume check: MISSED a change seen by the polling at {at} ms, no notification came"),
++                Verdict::Extra(at) => log::warn!("volume check: EXTRA notification at {at} ms, the polling saw no change"),
++            }
++        }
++        let counters = [check.changes_seen, check.notifs_seen, check.missed, check.extra];
++        let mut last = LAST_SUMMARY.lock().unwrap();
++        if counters != last.1 && now >= last.0 + SUMMARY_EVERY_MS {
++            *last = (now, counters);
++            log::info!(
++                "volume check: changes={} notifications={} missed={} extra={}",
++                counters[0], counters[1], counters[2], counters[3]
++            );
++        }
++    }
++
++    /// "ready" must have held this long: the system volume follows the output with a delay.
++    const READY_SETTLE_MS: u64 = 1500;
++    /// Without a route file: after this device became active the output route may still be switched.
++    const ACTIVATION_GRACE: Duration = Duration::from_secs(3);
++
++    struct Bridge {
++        logic: VolumeLogic,
++        active_since: Option<Instant>,
++        /// Ticket of the send that `poll_external` returned last, for `sent`.
++        ticket: Option<u64>,
++        /// When the route volume was last looked at (notify mode: for the safety poll).
++        last_look_ms: u64,
++    }
++
++    /// Notify mode: a ready and synced route is looked at this often even when no notification came,
++    /// in case the KVO stops delivering (nothing would tell us). Rare enough to cost nothing.
++    const SAFETY_POLL_MS: u64 = 5_000;
++
++    static BRIDGE: Mutex<Option<Bridge>> = Mutex::new(None);
++
++    fn managed() -> bool {
++        std::env::var_os("CB_ROUTE_FILE").is_some()
++    }
++
++    fn now_ms() -> u64 {
++        static START: OnceLock<Instant> = OnceLock::new();
++        START.get_or_init(Instant::now).elapsed().as_millis() as u64
++    }
++
++    fn with_bridge<R>(f: impl FnOnce(&mut Bridge) -> R) -> R {
++        let mut guard = BRIDGE.lock().unwrap();
++        let bridge = guard.get_or_insert_with(|| Bridge {
++            logic: VolumeLogic::new(if managed() { READY_SETTLE_MS } else { 0 }),
++            active_since: None,
++            ticket: None,
++            last_look_ms: 0,
++        });
++        f(bridge)
++    }
++
++    /// The route file is replaced by rename, so its identity (inode, size, mtime) changes with every
++    /// new content: only read it again when that has changed (this runs every 250 ms).
++    fn route_file_ready(path: &std::ffi::OsStr) -> bool {
++        use std::os::unix::fs::MetadataExt;
++        static CACHE: std::sync::Mutex<Option<((u64, u64, i64, i64), bool)>> = std::sync::Mutex::new(None);
++        let Ok(meta) = std::fs::metadata(path) else {
++            *CACHE.lock().unwrap() = None;
++            return false;
++        };
++        let identity = (meta.ino(), meta.len(), meta.mtime(), meta.mtime_nsec());
++        let mut cache = CACHE.lock().unwrap();
++        if let Some((cached, ready)) = *cache {
++            if cached == identity {
++                return ready;
++            }
++        }
++        let ready = std::fs::read_to_string(path).is_ok_and(|s| s.trim() == "ready");
++        *cache = Some((identity, ready));
++        ready
++    }
++
++    /// Is the wanted AirPlay device the system output right now?
++    fn route_ready(bridge: &Bridge) -> bool {
++        // With the AirPlay device required, a built-in output means that the route is gone (or not
++        // there yet). The system tells at once; connectbridged's file may be a moment behind.
++        if crate::route_guard::enabled() && crate::route_guard::output_leaks() {
++            return false;
++        }
++        match std::env::var_os("CB_ROUTE_FILE") {
++            // The route is not managed by connectbridged: nothing says when it has switched.
++            None => bridge.active_since.is_some_and(|since| since.elapsed() >= ACTIVATION_GRACE),
++            Some(path) => route_file_ready(&path),
++        }
++    }
++
++    /// The bridge only runs while this device is the active Connect device.
++    pub fn set_active(active: bool) {
++        with_bridge(|b| {
++            b.logic.set_active(active);
++            b.active_since = if active { Some(Instant::now()) } else { None };
++            b.ticket = None;
++        });
++    }
++
++    pub fn enabled() -> bool {
++        std::env::var_os("CB_VOLUME_BRIDGE").is_some()
++    }
++
++    /// Connect -> route.
++    pub fn apply_connect_volume(volume: u16) {
++        with_bridge(|b| {
++            let ready = route_ready(b);
++            match b.logic.connect_volume(volume, now_ms(), ready) {
++                Some(v) => {
++                    unsafe { cb_set_system_volume(v) };
++                    log::debug!("volume bridge: connect {volume} -> route {v:.3}");
++                }
++                None => log::debug!("volume bridge: ignoring connect {volume} until the route volume is synced"),
++            }
++        });
++    }
++
++    /// Route -> Connect. Returns the volume to send to Spirc; tell `sent` how it went.
++    pub fn poll_external() -> Option<u16> {
++        with_bridge(|b| {
++            let ready = route_ready(b);
++            check_sample(ready);
++            let now = now_ms();
++            // A notification is only taken when the route is ready: the volume of another route
++            // (the built-in speaker) means nothing, and the logic forgets everything meanwhile.
++            let notified = ready && NOTIFIED.swap(false, Ordering::AcqRel);
++            if !ready {
++                NOTIFIED.store(false, Ordering::Release);
++            }
++            // Without polling, a ready and synced route is only looked at when something says so.
++            if notify_mode()
++                && ready
++                && !notified
++                && !b.logic.needs_poll(now)
++                && now < b.last_look_ms + SAFETY_POLL_MS
++            {
++                return None;
++            }
++            b.last_look_ms = now;
++            let (volume, ticket) = b.logic.poll(now, ready, true, || unsafe { cb_get_system_volume() })?;
++            b.ticket = Some(ticket);
++            log::debug!("volume bridge: route -> connect {volume}");
++            Some(volume)
++        })
++    }
++
++    /// Spirc's answer for the volume that `poll_external` returned.
++    pub fn sent(ok: bool) {
++        with_bridge(|b| {
++            if let Some(ticket) = b.ticket.take() {
++                b.logic.sent(ticket, ok, now_ms());
++            }
++        });
++    }
++}
++
++#[cfg(not(target_os = "ios"))]
++mod imp {
++    pub fn enabled() -> bool {
++        false
++    }
++    pub fn set_active(_active: bool) {}
++    pub fn apply_connect_volume(_volume: u16) {}
++    pub fn poll_external() -> Option<u16> {
++        None
++    }
++    pub fn sent(_ok: bool) {}
++}
++
++pub use imp::{apply_connect_volume, enabled, poll_external, sent, set_active};
+diff --git a/src/volume_logic.rs b/src/volume_logic.rs
+new file mode 100644
+index 0000000..1fa5ef0
+--- /dev/null
++++ b/src/volume_logic.rs
+@@ -0,0 +1,469 @@
++//! connectbridge: the state machine of the volume sync between Spotify Connect and the output
++//! route, without any platform calls, so that it can be tested on a Mac
++//! (`scripts/test-daemon.sh` runs the tests below with `rustc --test`).
++//!
++//! Rules:
++//! - Nothing is read from or written to the route unless the route is the wanted AirPlay device
++//!   (`ready`). The moment it is not (lost, being switched, status unreadable) everything is
++//!   forgotten: synced or not, what was applied, what was being sent.
++//! - Back to `ready`, the route must stay `ready` for `settle_ms` before the first sync, which
++//!   sends the route volume to Connect once, whether it changed or not.
++//! - A send counts only when Spirc accepted it (`sent`); otherwise it is tried again later.
++//!   A result for a send from before the route was lost is ignored (ticket / generation).
++//! - After the first sync, a change of the route volume that we did not cause is sent to Connect,
++//!   and a Connect volume is applied to the route.
++//!
++//! Times are milliseconds on any monotonic clock.
++
++#![allow(dead_code)]
++
++/// Volumes closer than this are considered equal (HomePod quantizes its steps).
++pub const TOLERANCE: f32 = 0.015;
++/// After we apply a Connect volume the route needs a moment to report it back.
++pub const SETTLE_MS: u64 = 1500;
++/// Wait before the initial send is tried again.
++pub const RETRY_MS: u64 = 1000;
++
++struct Sending {
++    initial: bool,
++    volume: f32,
++    /// `applied` before an external-change send (restored when it fails).
++    previous: f32,
++    ticket: u64,
++}
++
++pub struct VolumeLogic {
++    /// How long the route must have been ready before the first sync.
++    ready_settle_ms: u64,
++    active: bool,
++    synced: bool,
++    ready_since: Option<u64>,
++    retry_at: Option<u64>,
++    sending: Option<Sending>,
++    /// The route volume as of the last sync / apply, and when.
++    applied: Option<(f32, u64)>,
++    generation: u64,
++    /// Without polling (`needs_poll`): when the route volume has to be looked at again although no
++    /// notification came: the end of the settle window after we applied / sent a volume (a change
++    /// during the window was ignored), or at once after a failed send.
++    due_at: Option<u64>,
++}
++
++fn to_u16(volume: f32) -> u16 {
++    (volume.clamp(0.0, 1.0) * u16::MAX as f32).round() as u16
++}
++
++impl VolumeLogic {
++    pub fn new(ready_settle_ms: u64) -> Self {
++        VolumeLogic {
++            ready_settle_ms,
++            active: false,
++            synced: false,
++            ready_since: None,
++            retry_at: None,
++            sending: None,
++            applied: None,
++            generation: 0,
++            due_at: None,
++        }
++    }
++
++    fn mark_due(&mut self, t: u64) {
++        self.due_at = Some(self.due_at.map_or(t, |d| d.min(t)));
++    }
++
++    /// For a caller that does not poll every tick but waits for the system's volume notification:
++    /// must `poll` be called now although no notification came? True until the first sync is done
++    /// (it only waits for time and for Spirc), and when a look at the route volume was put off
++    /// (settle window, failed send, a send that was in progress).
++    pub fn needs_poll(&self, now: u64) -> bool {
++        self.active && (!self.synced || self.due_at.is_some_and(|t| now >= t))
++    }
++
++    fn forget(&mut self) {
++        self.synced = false;
++        self.ready_since = None;
++        self.retry_at = None;
++        self.sending = None;
++        self.applied = None;
++        self.due_at = None;
++        self.generation += 1; // results of sends from before are stale now
++    }
++
++    /// This device became (or stopped being) the active Connect device.
++    pub fn set_active(&mut self, active: bool) {
++        self.active = active;
++        self.forget();
++    }
++
++    pub fn is_synced(&self) -> bool {
++        self.synced
++    }
++
++    /// Takes the route status. Returns whether the route is ready; if it is not, everything is
++    /// forgotten at once.
++    fn route(&mut self, ready: bool, now: u64) -> bool {
++        if !ready {
++            if self.synced || self.ready_since.is_some() || self.sending.is_some() || self.applied.is_some() || self.retry_at.is_some() {
++                self.forget();
++            }
++            return false;
++        }
++        self.ready_since.get_or_insert(now);
++        true
++    }
++
++    /// Connect -> route. Returns the route volume to set, if setting it is allowed now.
++    pub fn connect_volume(&mut self, volume: u16, now: u64, ready: bool) -> Option<f32> {
++        if !self.active || !self.route(ready, now) || !self.synced {
++            return None; // not synced yet: the route volume wins, the Connect one waits
++        }
++        let v = volume as f32 / u16::MAX as f32;
++        self.applied = Some((v, now));
++        self.mark_due(now + SETTLE_MS); // a change of the route volume before that is ignored
++        Some(v)
++    }
++
++    /// Route -> Connect. Returns the volume to send to Spirc, with the ticket to give `sent`.
++    /// `read` reads the route volume (negative: unknown); it is only called when the route is
++    /// ready. `allowed` is a further condition for the first sync (e.g. the output is not the
++    /// built-in speaker).
++    pub fn poll(&mut self, now: u64, ready: bool, allowed: bool, read: impl FnOnce() -> f32) -> Option<(u16, u64)> {
++        if !self.active || !self.route(ready, now) {
++            return None;
++        }
++        if !self.synced {
++            let since = self.ready_since.unwrap_or(now);
++            if self.sending.is_some()
++                || self.retry_at.is_some_and(|t| now < t)
++                || now.saturating_sub(since) < self.ready_settle_ms
++                || !allowed
++            {
++                return None;
++            }
++            let cur = read();
++            if cur < 0.0 {
++                return None;
++            }
++            self.sending = Some(Sending { initial: true, volume: cur, previous: cur, ticket: self.generation });
++            return Some((to_u16(cur), self.generation));
++        }
++        let cur = read();
++        if cur < 0.0 {
++            self.mark_due(now + RETRY_MS); // could not be read: try again, a notification may not come
++            return None;
++        }
++        let (applied, at) = self.applied?;
++        if now.saturating_sub(at) < SETTLE_MS || self.sending.is_some() {
++            return None; // looked at again later: `due_at` / `sent`
++        }
++        if self.due_at.is_some_and(|t| now >= t) {
++            self.due_at = None; // looked at it now
++        }
++        if (cur - applied).abs() < TOLERANCE {
++            return None;
++        }
++        self.sending = Some(Sending { initial: false, volume: cur, previous: applied, ticket: self.generation });
++        self.applied = Some((cur, now));
++        self.mark_due(now + SETTLE_MS);
++        Some((to_u16(cur), self.generation))
++    }
++
++    /// Spirc's answer for the send that `poll` returned with `ticket`.
++    pub fn sent(&mut self, ticket: u64, ok: bool, now: u64) {
++        if ticket != self.generation {
++            return; // the route was lost (and maybe is back) since: not this sync's result
++        }
++        let Some(sending) = self.sending.take() else { return };
++        if sending.ticket != ticket {
++            return;
++        }
++        if sending.initial {
++            if ok {
++                self.synced = true;
++                self.applied = Some((sending.volume, now));
++                self.mark_due(now + SETTLE_MS);
++            } else {
++                self.retry_at = Some(now + RETRY_MS);
++            }
++        } else if !ok {
++            // Back to what it was: the difference is seen again and sent again.
++            self.applied = Some((sending.previous, now.saturating_sub(SETTLE_MS)));
++            self.mark_due(now);
++        } else {
++            self.mark_due(now); // changes while the send was in progress were not looked at
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::cell::Cell;
++
++    const SETTLE: u64 = 1500;
++
++    fn logic() -> VolumeLogic {
++        let mut l = VolumeLogic::new(SETTLE);
++        l.set_active(true);
++        l
++    }
++
++    /// Polls with a route volume and counts the reads.
++    fn poll(l: &mut VolumeLogic, now: u64, ready: bool, volume: f32, reads: &Cell<u32>) -> Option<(u16, u64)> {
++        l.poll(now, ready, true, || {
++            reads.set(reads.get() + 1);
++            volume
++        })
++    }
++
++    #[test]
++    fn pending_then_ready_then_stable_then_synced() {
++        let mut l = logic();
++        let reads = Cell::new(0);
++        assert_eq!(poll(&mut l, 0, false, 0.4, &reads), None); // selecting
++        assert_eq!(poll(&mut l, 250, false, 0.4, &reads), None);
++        assert_eq!(poll(&mut l, 1000, true, 0.4, &reads), None); // ready, but not for long
++        assert_eq!(poll(&mut l, 2400, true, 0.4, &reads), None); // 1400 ms
++        assert_eq!(reads.get(), 0, "the route volume is not read before it is stable");
++        let (volume, ticket) = poll(&mut l, 2500, true, 0.4, &reads).expect("initial sync");
++        assert_eq!(volume, (0.4f32 * u16::MAX as f32).round() as u16);
++        assert!(!l.is_synced(), "not synced before Spirc accepted it");
++        l.sent(ticket, true, 2500);
++        assert!(l.is_synced());
++        // The echo from Connect is within the tolerance: not sent again; the route follows Connect.
++        assert_eq!(poll(&mut l, 5000, true, 0.4, &reads), None);
++        assert!(l.connect_volume((0.4f32 * u16::MAX as f32) as u16, 5100, true).is_some());
++    }
++
++    #[test]
++    fn already_selected_route_is_synced_too() {
++        // Ready from the first look: after the settle time the volume is sent, changed or not.
++        let mut l = logic();
++        let reads = Cell::new(0);
++        assert_eq!(poll(&mut l, 0, true, 0.2, &reads), None);
++        assert!(poll(&mut l, SETTLE, true, 0.2, &reads).is_some());
++    }
++
++    #[test]
++    fn route_lost_unsyncs_at_once() {
++        let mut l = logic();
++        let reads = Cell::new(0);
++        poll(&mut l, 0, true, 0.4, &reads);
++        let (_, ticket) = poll(&mut l, SETTLE, true, 0.4, &reads).unwrap();
++        l.sent(ticket, true, SETTLE);
++        assert!(l.is_synced());
++        assert_eq!(poll(&mut l, 5000, false, 0.9, &reads), None); // ready -> pending
++        assert!(!l.is_synced());
++    }
++
++    #[test]
++    fn nothing_is_read_or_applied_while_not_ready() {
++        let mut l = logic();
++        let reads = Cell::new(0);
++        // Synced, then the route is lost.
++        poll(&mut l, 0, true, 0.4, &reads);
++        let (_, ticket) = poll(&mut l, SETTLE, true, 0.4, &reads).unwrap();
++        l.sent(ticket, true, SETTLE);
++        let before = reads.get();
++        for now in [4000u64, 4250, 4500, 9000] {
++            assert_eq!(poll(&mut l, now, false, 0.9, &reads), None);
++            assert_eq!(l.connect_volume(30000, now, false), None, "a Connect volume must not reach the wrong output");
++        }
++        assert_eq!(reads.get(), before, "the route volume must not be read while the route is not ready");
++        // Not ready for any reason (file missing, unreadable): the caller says ready=false. A Connect
++        // volume is also not applied just because the route was synced before.
++        assert_eq!(l.connect_volume(30000, 9500, true), None, "ready again, but not synced again yet");
++    }
++
++    #[test]
++    fn ready_again_syncs_again_after_the_settle_time() {
++        let mut l = logic();
++        let reads = Cell::new(0);
++        poll(&mut l, 0, true, 0.4, &reads);
++        let (_, t1) = poll(&mut l, SETTLE, true, 0.4, &reads).unwrap();
++        l.sent(t1, true, SETTLE);
++        assert_eq!(poll(&mut l, 3000, false, 0.8, &reads), None); // lost
++        assert_eq!(poll(&mut l, 4000, true, 0.8, &reads), None); // back: not at once
++        assert_eq!(poll(&mut l, 5400, true, 0.8, &reads), None);
++        let (volume, t2) = poll(&mut l, 5500, true, 0.8, &reads).expect("synced again");
++        assert_eq!(volume, (0.8f32 * u16::MAX as f32).round() as u16, "the volume of the new route, sent once");
++        assert_ne!(t1, t2);
++        l.sent(t2, true, 5500);
++        assert!(l.is_synced());
++    }
++
++    #[test]
++    fn failed_initial_send_is_tried_again() {
++        let mut l = logic();
++        let reads = Cell::new(0);
++        poll(&mut l, 0, true, 0.4, &reads);
++        let (_, ticket) = poll(&mut l, SETTLE, true, 0.4, &reads).unwrap();
++        l.sent(ticket, false, SETTLE);
++        assert!(!l.is_synced(), "a failed send is not a sync");
++        assert_eq!(l.connect_volume(30000, SETTLE + 10, true), None);
++        assert_eq!(poll(&mut l, SETTLE + 500, true, 0.4, &reads), None, "not hammered");
++        let (_, ticket) = poll(&mut l, SETTLE + RETRY_MS, true, 0.4, &reads).expect("retry");
++        l.sent(ticket, true, SETTLE + RETRY_MS);
++        assert!(l.is_synced());
++    }
++
++    #[test]
++    fn result_from_before_the_route_was_lost_is_ignored() {
++        let mut l = logic();
++        let reads = Cell::new(0);
++        poll(&mut l, 0, true, 0.4, &reads);
++        let (_, old) = poll(&mut l, SETTLE, true, 0.4, &reads).unwrap(); // send in flight
++        assert_eq!(poll(&mut l, SETTLE + 100, false, 0.4, &reads), None); // route lost meanwhile
++        l.sent(old, true, SETTLE + 200); // the late answer
++        assert!(!l.is_synced(), "a stale answer must not make the new route synced");
++        // ...also when the route is back and a new send is in flight.
++        assert_eq!(poll(&mut l, 3000, true, 0.6, &reads), None);
++        let (_, new) = poll(&mut l, 4500, true, 0.6, &reads).unwrap();
++        l.sent(old, true, 4600);
++        assert!(!l.is_synced());
++        l.sent(new, true, 4700);
++        assert!(l.is_synced());
++    }
++
++    #[test]
++    fn external_change_is_sent_and_retried_on_failure() {
++        let mut l = logic();
++        let reads = Cell::new(0);
++        poll(&mut l, 0, true, 0.4, &reads);
++        let (_, t) = poll(&mut l, SETTLE, true, 0.4, &reads).unwrap();
++        l.sent(t, true, SETTLE);
++        let (volume, t) = poll(&mut l, 5000, true, 0.7, &reads).expect("the route volume changed");
++        assert_eq!(volume, (0.7f32 * u16::MAX as f32).round() as u16);
++        l.sent(t, false, 5000);
++        let (_, t) = poll(&mut l, 6600, true, 0.7, &reads).expect("sent again after the failure");
++        l.sent(t, true, 6600);
++        assert_eq!(poll(&mut l, 9000, true, 0.7, &reads), None);
++    }
++
++    #[test]
++    fn connect_volume_waits_until_synced() {
++        let mut l = logic();
++        assert_eq!(l.connect_volume(30000, 0, true), None);
++        let reads = Cell::new(0);
++        poll(&mut l, 100, true, 0.4, &reads);
++        let (_, t) = poll(&mut l, 100 + SETTLE, true, 0.4, &reads).unwrap();
++        assert_eq!(l.connect_volume(30000, 100 + SETTLE, true), None, "still waiting for Spirc's answer");
++        l.sent(t, true, 100 + SETTLE);
++        assert!(l.connect_volume(30000, 2000, true).is_some());
++    }
++
++    #[test]
++    fn reselect_syncs_again_and_inactive_does_nothing() {
++        let mut l = logic();
++        let reads = Cell::new(0);
++        poll(&mut l, 0, true, 0.4, &reads);
++        let (_, t) = poll(&mut l, SETTLE, true, 0.4, &reads).unwrap();
++        l.sent(t, true, SETTLE);
++        l.set_active(false);
++        assert_eq!(poll(&mut l, 4000, true, 0.4, &reads), None);
++        assert_eq!(l.connect_volume(30000, 4000, true), None);
++        l.set_active(true); // selected again during ReleaseDelay
++        assert!(!l.is_synced());
++        assert_eq!(poll(&mut l, 5000, true, 0.4, &reads), None);
++        assert!(poll(&mut l, 5000 + SETTLE, true, 0.4, &reads).is_some());
++    }
++
++    #[test]
++    fn extra_condition_holds_the_first_sync_back() {
++        let mut l = logic();
++        assert_eq!(l.poll(0, true, false, || 0.4), None);
++        assert_eq!(l.poll(SETTLE, true, false, || 0.4), None);
++        assert!(l.poll(SETTLE + 10, true, true, || 0.4).is_some());
++    }
++
++    #[test]
++    fn unmanaged_route_uses_no_settle() {
++        let mut l = VolumeLogic::new(0);
++        l.set_active(true);
++        assert!(l.poll(0, true, true, || 0.4).is_some());
++    }
++
++    // --- without polling: `needs_poll` says when a look at the route volume is due without a notification ---
++
++    fn synced_at(l: &mut VolumeLogic, reads: &Cell<u32>, volume: f32) {
++        poll(l, 0, true, volume, reads);
++        let (_, t) = poll(l, SETTLE, true, volume, reads).unwrap();
++        l.sent(t, true, SETTLE);
++    }
++
++    #[test]
++    fn needs_poll_until_synced_then_only_when_due() {
++        let mut l = logic();
++        let reads = Cell::new(0);
++        assert!(l.needs_poll(0), "the first sync waits for time");
++        synced_at(&mut l, &reads, 0.4);
++        assert!(!l.needs_poll(SETTLE + 100), "synced a moment ago: the settle window is not over, a poll would ignore it");
++        assert!(l.needs_poll(SETTLE + SETTLE), "end of the settle window: a change during it was not looked at");
++        assert_eq!(poll(&mut l, 2 * SETTLE, true, 0.4, &reads), None);
++        assert!(!l.needs_poll(2 * SETTLE + 10), "looked at, nothing to do: waits for a notification");
++        assert!(!l.needs_poll(1_000_000));
++    }
++
++    #[test]
++    fn change_during_the_settle_window_is_found_when_it_ends() {
++        let mut l = logic();
++        let reads = Cell::new(0);
++        synced_at(&mut l, &reads, 0.4);
++        // the route volume changes inside the window; the notification only finds the window open
++        assert_eq!(poll(&mut l, SETTLE + 300, true, 0.8, &reads), None);
++        assert!(!l.needs_poll(SETTLE + 400));
++        assert!(l.needs_poll(2 * SETTLE), "due at the end of the window, no new notification needed");
++        let (volume, _) = poll(&mut l, 2 * SETTLE, true, 0.8, &reads).expect("sent when the window is over");
++        assert_eq!(volume, (0.8f32 * u16::MAX as f32).round() as u16);
++    }
++
++    #[test]
++    fn connect_volume_opens_a_settle_window_that_ends_with_a_look() {
++        let mut l = logic();
++        let reads = Cell::new(0);
++        synced_at(&mut l, &reads, 0.4);
++        assert_eq!(poll(&mut l, 2 * SETTLE, true, 0.4, &reads), None);
++        assert!(!l.needs_poll(5_000));
++        l.connect_volume(30_000, 5_000, true).unwrap();
++        assert!(!l.needs_poll(5_000 + SETTLE - 1));
++        assert!(l.needs_poll(5_000 + SETTLE));
++        assert_eq!(poll(&mut l, 5_000 + SETTLE, true, 30_000.0 / 65535.0, &reads), None);
++        assert!(!l.needs_poll(5_000 + SETTLE + 1));
++    }
++
++    #[test]
++    fn failed_send_is_due_at_once_and_a_finished_send_is_looked_at_again() {
++        let mut l = logic();
++        let reads = Cell::new(0);
++        synced_at(&mut l, &reads, 0.4);
++        let (_, t) = poll(&mut l, 5_000, true, 0.7, &reads).unwrap();
++        l.sent(t, false, 5_100);
++        assert!(l.needs_poll(5_100), "the difference has to be sent again without a new notification");
++        let (_, t) = poll(&mut l, 5_100, true, 0.7, &reads).unwrap();
++        l.sent(t, true, 5_200);
++        assert!(l.needs_poll(5_200), "volume changes while the send was in progress were not looked at");
++        assert_eq!(poll(&mut l, 5_200, true, 0.7, &reads), None);
++    }
++
++    #[test]
++    fn unreadable_route_volume_is_tried_again() {
++        let mut l = logic();
++        let reads = Cell::new(0);
++        synced_at(&mut l, &reads, 0.4);
++        assert_eq!(poll(&mut l, 4_000, true, 0.4, &reads), None); // looked at: nothing due any more
++        assert_eq!(poll(&mut l, 5_000, true, -1.0, &reads), None);
++        assert!(!l.needs_poll(5_000 + RETRY_MS - 1));
++        assert!(l.needs_poll(5_000 + RETRY_MS));
++        assert!(poll(&mut l, 5_000 + RETRY_MS, true, 0.9, &reads).is_some());
++    }
++
++    #[test]
++    fn route_lost_clears_what_was_due() {
++        let mut l = logic();
++        let reads = Cell::new(0);
++        synced_at(&mut l, &reads, 0.4);
++        assert_eq!(poll(&mut l, 9_000, false, 0.4, &reads), None); // lost
++        assert!(l.needs_poll(9_000), "not synced any more: the first sync is waited for");
++    }
++}

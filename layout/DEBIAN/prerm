@@ -1,0 +1,8 @@
+#!/var/jb/bin/sh
+# launchctl unload stops the daemon without letting it clean up: ask it to give the AirPlay route
+# back first (SIGUSR1), otherwise the speaker stays connected to this iPhone.
+if killall -USR1 connectbridged 2>/dev/null; then
+	sleep 4
+fi
+launchctl unload /var/jb/Library/LaunchDaemons/com.sui827.connectbridge.plist 2>/dev/null
+exit 0

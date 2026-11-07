@@ -1,0 +1,53 @@
+name: Build ConnectBridge
+description: Builds the patched librespot and the rootless deb (packages/*.deb). Needs a macOS runner with Xcode.
+
+inputs:
+  theos-ref:
+    description: Theos commit to build with (a full SHA, so that builds are reproducible)
+    default: 6e7b8c40e0f5f9f5b2377800dc1e42cd2560d24a
+
+runs:
+  using: composite
+  steps:
+    - name: Install ldid and dpkg
+      shell: bash
+      run: brew install ldid dpkg
+
+    - name: Set up Rust
+      shell: bash
+      run: rustup toolchain install stable --profile minimal --target aarch64-apple-ios --no-self-update && rustup default stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: cargo-${{ runner.os }}-${{ hashFiles('librespot/ios-bridge.patch', 'librespot/libmdns-ios.patch', 'scripts/build-librespot.sh') }}
+        restore-keys: cargo-${{ runner.os }}-
+
+    - name: Install Theos
+      shell: bash
+      env:
+        THEOS_REF: ${{ inputs.theos-ref }}
+      run: |
+        git init -q "$HOME/theos"
+        git -C "$HOME/theos" remote add origin https://github.com/theos/theos.git
+        git -C "$HOME/theos" fetch -q --depth 1 origin "$THEOS_REF"
+        git -C "$HOME/theos" checkout -q FETCH_HEAD
+        git -C "$HOME/theos" submodule update -q --init --recursive --depth 1
+        echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+
+    - name: Build librespot
+      shell: bash
+      run: |
+        source env.sh
+        scripts/build-librespot.sh
+
+    - name: Build the package
+      shell: bash
+      run: |
+        source env.sh
+        make package FINALPACKAGE=1
+        ls -l packages
+        dpkg-deb -I packages/*.deb

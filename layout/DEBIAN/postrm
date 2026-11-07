@@ -1,0 +1,7 @@
+#!/var/jb/bin/sh
+# "dpkg --remove" keeps the settings and the stored Spotify login; "--purge" deletes them.
+if [ "$1" = "purge" ]; then
+	rm -rf /var/mobile/Library/ConnectBridge
+	rm -f /var/mobile/Library/Preferences/com.sui827.connectbridge.plist
+fi
+exit 0

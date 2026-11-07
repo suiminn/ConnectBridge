@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Rust
+        run: rustup toolchain install stable --profile minimal --target aarch64-apple-ios --no-self-update && rustup default stable
+
+      - name: Lint plists and scripts
+        run: |
+          find . -name '*.plist' -not -path './build/*' -not -path './.theos/*' -print0 | xargs -0 plutil -lint
+          for script in scripts/*.sh layout/DEBIAN/postinst layout/DEBIAN/prerm layout/DEBIAN/postrm; do bash -n "$script"; done
+
+      - name: Host tests
+        run: scripts/test-daemon.sh
+
+      - uses: ./.github/actions/build
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: connectbridge-deb
+          path: packages/*.deb
+          if-no-files-found: error
+          retention-days: 14

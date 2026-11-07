@@ -1,0 +1,269 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>items</key>
+	<array>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>footerText</key>
+			<string>ConnectBridge only holds the AirPlay device while it is selected in Spotify Connect.</string>
+			<key>label</key>
+			<string>Status</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSTitleValueCell</string>
+			<key>get</key>
+			<string>statusText:</string>
+			<key>id</key>
+			<string>status</string>
+			<key>label</key>
+			<string>Status</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSTitleValueCell</string>
+			<key>get</key>
+			<string>connectNameText:</string>
+			<key>id</key>
+			<string>connectName</string>
+			<key>label</key>
+			<string>Name in Spotify</string>
+		</dict>
+		<dict>
+			<key>action</key>
+			<string>restartService:</string>
+			<key>cell</key>
+			<string>PSButtonCell</string>
+			<key>label</key>
+			<string>Restart Service</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>Spotify Connect</string>
+		</dict>
+		<dict>
+			<key>PostNotification</key>
+			<string>com.sui827.connectbridge/prefs</string>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<true/>
+			<key>defaults</key>
+			<string>com.sui827.connectbridge</string>
+			<key>key</key>
+			<string>Enabled</string>
+			<key>label</key>
+			<string>Enabled</string>
+		</dict>
+		<dict>
+			<key>PostNotification</key>
+			<string>com.sui827.connectbridge/prefs</string>
+			<key>autoCaps</key>
+			<string>None</string>
+			<key>cell</key>
+			<string>PSEditTextCell</string>
+			<key>default</key>
+			<string></string>
+			<key>defaults</key>
+			<string>com.sui827.connectbridge</string>
+			<key>key</key>
+			<string>ConnectName</string>
+			<key>label</key>
+			<string>Device Name</string>
+			<key>noAutoCorrect</key>
+			<true/>
+			<key>placeholder</key>
+			<string>Automatic</string>
+		</dict>
+		<dict>
+			<key>PostNotification</key>
+			<string>com.sui827.connectbridge/prefs</string>
+			<key>cell</key>
+			<string>PSLinkListCell</string>
+			<key>default</key>
+			<integer>160</integer>
+			<key>defaults</key>
+			<string>com.sui827.connectbridge</string>
+			<key>detail</key>
+			<string>PSListItemsController</string>
+			<key>key</key>
+			<string>Bitrate</string>
+			<key>label</key>
+			<string>Quality</string>
+			<key>validTitles</key>
+			<array>
+				<string>96 kbps</string>
+				<string>160 kbps</string>
+				<string>320 kbps</string>
+			</array>
+			<key>validValues</key>
+			<array>
+				<integer>96</integer>
+				<integer>160</integer>
+				<integer>320</integer>
+			</array>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>footerText</key>
+			<string>Choose the speaker to play on. Nothing is advertised in Spotify until one is chosen. The name in Spotify is "&lt;AirPlay device&gt; (via &lt;this iPhone&gt;)" unless you set one above. A changed device name or quality restarts the service.</string>
+			<key>label</key>
+			<string>Output</string>
+		</dict>
+		<dict>
+			<key>PostNotification</key>
+			<string>com.sui827.connectbridge/prefs</string>
+			<key>cell</key>
+			<string>PSLinkListCell</string>
+			<key>default</key>
+			<string></string>
+			<key>defaults</key>
+			<string>com.sui827.connectbridge</string>
+			<key>detail</key>
+			<string>PSListItemsController</string>
+			<key>id</key>
+			<string>outputDevice</string>
+			<key>key</key>
+			<string>OutputDeviceName</string>
+			<key>label</key>
+			<string>AirPlay Device</string>
+			<key>validTitles</key>
+			<array>
+				<string>Not Selected</string>
+			</array>
+			<key>validValues</key>
+			<array>
+				<string></string>
+			</array>
+		</dict>
+		<dict>
+			<key>PostNotification</key>
+			<string>com.sui827.connectbridge/prefs</string>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<true/>
+			<key>defaults</key>
+			<string>com.sui827.connectbridge</string>
+			<key>key</key>
+			<string>ManageRoute</string>
+			<key>label</key>
+			<string>Only While Selected</string>
+		</dict>
+		<dict>
+			<key>PostNotification</key>
+			<string>com.sui827.connectbridge/prefs</string>
+			<key>cell</key>
+			<string>PSLinkListCell</string>
+			<key>default</key>
+			<integer>15</integer>
+			<key>defaults</key>
+			<string>com.sui827.connectbridge</string>
+			<key>detail</key>
+			<string>PSListItemsController</string>
+			<key>key</key>
+			<string>ReleaseDelay</string>
+			<key>label</key>
+			<string>Release After</string>
+			<key>validTitles</key>
+			<array>
+				<string>Immediately</string>
+				<string>5 seconds</string>
+				<string>15 seconds</string>
+				<string>30 seconds</string>
+				<string>1 minute</string>
+			</array>
+			<key>validValues</key>
+			<array>
+				<integer>0</integer>
+				<integer>5</integer>
+				<integer>15</integer>
+				<integer>30</integer>
+				<integer>60</integer>
+			</array>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>footerText</key>
+			<string>If AirPlay drops, the audio is muted at once and playback pauses instead of coming out of the iPhone speaker. It resumes when the AirPlay device is back.</string>
+			<key>label</key>
+			<string>AirPlay Guard</string>
+		</dict>
+		<dict>
+			<key>PostNotification</key>
+			<string>com.sui827.connectbridge/prefs</string>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<true/>
+			<key>defaults</key>
+			<string>com.sui827.connectbridge</string>
+			<key>key</key>
+			<string>AirPlayGuard</string>
+			<key>label</key>
+			<string>Never Use iPhone Speaker</string>
+		</dict>
+		<dict>
+			<key>PostNotification</key>
+			<string>com.sui827.connectbridge/prefs</string>
+			<key>cell</key>
+			<string>PSLinkListCell</string>
+			<key>default</key>
+			<integer>30</integer>
+			<key>defaults</key>
+			<string>com.sui827.connectbridge</string>
+			<key>detail</key>
+			<string>PSListItemsController</string>
+			<key>key</key>
+			<string>GuardResumeSeconds</string>
+			<key>label</key>
+			<string>Resume Within</string>
+			<key>validTitles</key>
+			<array>
+				<string>10 seconds</string>
+				<string>30 seconds</string>
+				<string>1 minute</string>
+				<string>2 minutes</string>
+			</array>
+			<key>validValues</key>
+			<array>
+				<integer>10</integer>
+				<integer>30</integer>
+				<integer>60</integer>
+				<integer>120</integer>
+			</array>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>footerText</key>
+			<string>Writes /var/mobile/Library/ConnectBridge/librespot.log.</string>
+			<key>label</key>
+			<string>Debug</string>
+		</dict>
+		<dict>
+			<key>PostNotification</key>
+			<string>com.sui827.connectbridge/prefs</string>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<false/>
+			<key>defaults</key>
+			<string>com.sui827.connectbridge</string>
+			<key>key</key>
+			<string>Verbose</string>
+			<key>label</key>
+			<string>Verbose Log</string>
+		</dict>
+	</array>
+	<key>title</key>
+	<string>ConnectBridge</string>
+</dict>
+</plist>

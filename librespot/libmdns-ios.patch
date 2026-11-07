@@ -1,0 +1,27 @@
+diff -ru a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs	2026-11-06 17:23:51
++++ b/src/lib.rs	2026-11-06 17:23:51
+@@ -236,6 +236,12 @@
+         let services = Arc::new(RwLock::new(ServicesInner::new(hostname)));
+ 
+         let v4 = FSM::<Inet>::new(&services, allowed_ips.clone());
++        // connectbridge: on iOS a multicast send to ff02::fb has no interface to go out of (the
++        // socket has no scope) and fails with "No route to host" for every answer. Discovery works
++        // over IPv4, so IPv6 is not used there.
++        #[cfg(target_os = "ios")]
++        let v6: io::Result<(FSM<Inet6>, _)> = Err(io::Error::new(io::ErrorKind::Unsupported, "IPv6 mDNS is off on iOS"));
++        #[cfg(not(target_os = "ios"))]
+         let v6 = FSM::<Inet6>::new(&services, allowed_ips);
+ 
+         let (task, commands): (ResponderTask, _) = match (v4, v6) {
+@@ -245,7 +251,9 @@
+             }
+ 
+             (Ok((v4_task, v4_command)), Err(err)) => {
+-                warn!("Failed to register IPv6 receiver: {err:?}");
++                if err.kind() != io::ErrorKind::Unsupported {
++                    warn!("Failed to register IPv6 receiver: {err:?}");
++                }
+                 (Box::new(v4_task), vec![v4_command])
+             }
+ 

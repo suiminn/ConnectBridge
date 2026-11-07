@@ -1,0 +1,11 @@
+Package: com.sui827.connectbridge
+Name: ConnectBridge
+Version: 0.1.0
+Architecture: iphoneos-arm64
+Description: Spotify Connect to AirPlay bridge
+ Makes the iPhone a Spotify Connect device that plays on an AirPlay speaker (HomePod).
+ Volume, Now Playing and the speaker controls work both ways. Needs Spotify Premium.
+Maintainer: sui827
+Author: sui827
+Section: Utilities
+Depends: firmware (>= 15.0), preferenceloader

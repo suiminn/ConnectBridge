@@ -1,0 +1,20 @@
+#!/var/jb/bin/sh
+# The data directory lives outside /var/jb, so it is created here. There is no default preferences
+# file: the defaults are in connectbridged (loadConfig) and in the Settings pane.
+DATA=/var/mobile/Library/ConnectBridge
+PLIST=/var/jb/Library/LaunchDaemons/com.sui827.connectbridge.plist
+
+# mobile can replace $DATA, and this script runs as root: a symlink there would make chmod change
+# whatever it points to (chmod follows symlinks). Remove the link itself, never what it points to.
+[ -L "$DATA" ] && rm -f "$DATA"
+mkdir -p "$DATA"
+chown -R mobile:mobile "$DATA"
+chmod 700 "$DATA"
+[ -f "$DATA/credentials.json" ] && [ ! -L "$DATA/credentials.json" ] && chmod 600 "$DATA/credentials.json"
+
+chown root:wheel "$PLIST"
+chmod 644 "$PLIST"
+
+launchctl unload "$PLIST" 2>/dev/null
+launchctl load "$PLIST"
+exit 0
