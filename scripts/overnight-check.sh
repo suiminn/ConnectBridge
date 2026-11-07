@@ -14,8 +14,10 @@ mkdir -p "$OUT"
 D=/var/mobile/Library/ConnectBridge
 snapshot() {
 	ssh -o BatchMode=yes -o ConnectTimeout=10 "root@$HOST" "
-		# grep -c prints 0 and fails when nothing matches, and prints nothing when the file is missing
-		cnt() { n=\$(grep -c \"\$1\" \"\$2\" 2>/dev/null); echo \"\${n:-0}\"; }
+		# Counts in the log and in its rotated copy (.1): the logs rotate at 2 MB, which a night with
+		# Verbose on can reach. grep -c prints 0 and fails when nothing matches, and prints nothing when
+		# the file is missing. (Only one generation is kept: after two rotations the oldest lines are gone.)
+		cnt() { t=0; for f in \"\$2\" \"\$2.1\"; do n=\$(grep -c \"\$1\" \"\$f\" 2>/dev/null); t=\$((t + \${n:-0})); done; echo \$t; }
 		echo \"time: \$(date '+%F %T %z')\"
 		echo \"uptime: \$(uptime | sed 's/^ *//')\"
 		for name in connectbridged librespot; do
@@ -40,6 +42,11 @@ snapshot() {
 		echo \"librespot_errors: \$(cnt ' ERROR ' $D/librespot.log)\"
 		echo \"daemon_log_bytes: \$(wc -c < $D/daemon.log)\"
 		echo \"librespot_log_bytes: \$(wc -c < $D/librespot.log)\"
+		# Identity of the rotated copy (.1): a rotation replaces it, and what was in the old one is gone
+		# from the counts above, whatever it held. A changed value means: rotated since the other snapshot.
+		gen() { ls -i \"\$1.1\" 2>/dev/null | cut -d' ' -f1 | grep . || echo none; }
+		echo \"log_gen_daemon: \$(gen $D/daemon.log)\"
+		echo \"log_gen_librespot: \$(gen $D/librespot.log)\"
 		echo \"last_daemon_lines:\"; tail -5 $D/daemon.log | cut -c1-160
 	"
 }
@@ -53,6 +60,13 @@ cat "$FILE"
 if [[ "$MODE" == "after" && -e "$OUT/latest-before.txt" ]]; then
 	echo
 	echo "=== comparison with the evening snapshot ($(readlink "$OUT/latest-before.txt")) ==="
+	for key in log_gen_daemon log_gen_librespot; do
+		b="$(sed -n "s/^$key: //p" "$OUT/latest-before.txt")"
+		a="$(sed -n "s/^$key: //p" "$OUT/latest-after.txt")"
+		if [[ "$b" != "$a" ]]; then
+			echo "WARNING: ${key#log_gen_} log was rotated during the night: the counts above lost the oldest lines, so a smaller number than in the evening is not a problem by itself."
+		fi
+	done
 	diff <(grep -E '^(proc|state|daemon_starts|librespot_starts|librespot_exits|strays_removed|route_|guard_|interruptions|authenticated|volume_|connection_|librespot_errors|daemon_log_bytes|librespot_log_bytes)' "$OUT/latest-before.txt") \
 	     <(grep -E '^(proc|state|daemon_starts|librespot_starts|librespot_exits|strays_removed|route_|guard_|interruptions|authenticated|volume_|connection_|librespot_errors|daemon_log_bytes|librespot_log_bytes)' "$OUT/latest-after.txt") || true
 fi

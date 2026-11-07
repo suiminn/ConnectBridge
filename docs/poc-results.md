@@ -185,8 +185,8 @@ librespot を iPhone で Spotify Connect の再生先として動かし、**本�
 - 症状: Spotify のデバイス一覧から選ぶと「Connecting」のまま止まる。librespot のログでは、転送とコンテキストの解決までは進むが、`Loading` が出ず、接続は生きたまま (ping/pong あり) で再生側だけが固まる。
 - 発生のきっかけ: いずれも、Siri に「次の曲」と言って Apple Music が起動した直後。Music.app のプロセスがバックグラウンドに残っていた。
 - 推測: Apple Music に音声セッションを奪われ (割り込み)、cpal のストリームが止まって再開しない。Player が書き込みで固まる。
-- 対策: `AVAudioSessionInterruptionNotification` (終了時) と `AVAudioSessionMediaServicesWereReset` で librespot を終了 (`exit(75)`)。`connectbridged` が作り直す。認証情報はキャッシュ済みなので数秒で戻る。
-- 状態: 対策後は再生できたが、**割り込みの通知を直接観測して回復する流れは未確認** (Siri で Music を開かせたあとに Spotify を選び直す試験が残っている)。
+- 対策: `AVAudioSessionInterruptionNotification` の終了時に `ShouldResume` があれば AudioSession を再有効化して現在の Connect セッションを維持する。再開不可、再有効化失敗、または `AVAudioSessionMediaServicesWereReset` の場合は librespot を終了 (`exit(75)`) し、`connectbridged` が作り直す。認証情報はキャッシュ済みなので数秒で戻る。
+- 状態: 無条件に終了する実装では、Siri の「次の曲」による短い割り込みでも Connect の選択が失われることを実機で確認した。`ShouldResume` の分岐は再試験が必要。
 
 ## Connect で選ばれている間だけ HomePod を掴む (ReleaseDelay)
 - 仕様: librespot の `SessionConnected` / `SessionDisconnected` (自分がアクティブなデバイスになった / 別のデバイスへ移った) を状態ファイル (`/var/mobile/Library/ConnectBridge/state`、`active` / `inactive`) に書き、`connectbridged` が 0.5 秒間隔で読む。`active` の間だけ HomePod を選んで保持し、`inactive` になってから `ReleaseDelay` 秒 (既定 15) 後に本体スピーカーへ戻す。待ち時間中に選び直されたら解放を取り消す。解放は、出力先が今も自分の選んだ HomePod のときだけ行う。起動直後は何も掴まない。

@@ -8,9 +8,16 @@ PLIST=/var/jb/Library/LaunchDaemons/com.sui827.connectbridge.plist
 # whatever it points to (chmod follows symlinks). Remove the link itself, never what it points to.
 [ -L "$DATA" ] && rm -f "$DATA"
 mkdir -p "$DATA"
-chown -R mobile:mobile "$DATA"
-chmod 700 "$DATA"
-[ -f "$DATA/credentials.json" ] && [ ! -L "$DATA/credentials.json" ] && chmod 600 "$DATA/credentials.json"
+# Only the directory itself, and with -h (a symlink put in place after the check above is not
+# followed). Nothing inside it is touched as root: mobile controls the contents, and a hard link to
+# a root-owned file would be chown'ed / chmod'ed through. connectbridged, which runs as mobile,
+# sets 0600 on the files in it (credentials.json included) when it starts.
+chown -h mobile:mobile "$DATA"
+chmod -h 700 "$DATA"
+# Files that an earlier version (or a root-run tool) left root-owned in it would be unusable for the
+# daemon. Regular files only, directly inside, with a single link (a hard link to a system file has
+# more); a symlink is never followed.
+find "$DATA" -maxdepth 1 -type f -user root -links 1 -exec chown mobile:mobile {} + 2>/dev/null || true
 
 chown root:wheel "$PLIST"
 chmod 644 "$PLIST"

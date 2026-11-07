@@ -98,6 +98,21 @@ static inline cb_action cb_release_decide(bool api_available, bool record_stale,
     return builtin_known ? CB_ACTION_RELEASE : CB_ACTION_RETRY;  // discovery has not found the built-in output yet
 }
 
+// A route selection request can finish after the Connect selection has ended. Until every request
+// has called back, a current non-match does not prove that the requested route will not still land.
+static inline cb_action cb_release_decide_while_selecting(bool selection_in_flight, bool api_available,
+                                                          bool record_stale, cb_match match, bool builtin_known) {
+    return selection_in_flight ? CB_ACTION_RETRY
+                               : cb_release_decide(api_available, record_stale, match, builtin_known);
+}
+
+// SIGUSR1 suppresses holding for the seconds before launchctl unload (prerm waits at most 6 s). A
+// service that is still running well after that was not stopped (aborted upgrade): resume holding.
+#define CB_SUPPRESS_HOLD_SECONDS 60
+static inline bool cb_suppress_expired(double seconds_since_signal) {
+    return seconds_since_signal >= CB_SUPPRESS_HOLD_SECONDS;
+}
+
 static inline cb_after cb_after_release(bool succeeded, int attempts_so_far) {
     if (succeeded) return CB_AFTER_CLEAR;
     return attempts_so_far >= CB_MAX_RELEASE_ATTEMPTS ? CB_AFTER_GIVE_UP : CB_AFTER_RETRY;

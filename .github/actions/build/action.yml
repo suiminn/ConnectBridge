@@ -15,7 +15,7 @@ runs:
 
     - name: Set up Rust
       shell: bash
-      run: rustup toolchain install stable --profile minimal --target aarch64-apple-ios --no-self-update && rustup default stable
+      run: rustup toolchain install 1.99.1 --profile minimal --target aarch64-apple-ios --no-self-update && rustup default 1.99.1  # pinned: raise it on purpose, together with a local build
 
     - name: Cache cargo registry
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -23,6 +23,7 @@ runs:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
+          build/cargo-target
         key: cargo-${{ runner.os }}-${{ hashFiles('librespot/ios-bridge.patch', 'librespot/libmdns-ios.patch', 'scripts/build-librespot.sh') }}
         restore-keys: cargo-${{ runner.os }}-
 

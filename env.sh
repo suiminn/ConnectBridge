@@ -16,9 +16,12 @@ if [ -z "${DEVELOPER_DIR:-}" ]; then
 fi
 
 # rustup (Homebrew keeps it out of the PATH) and cargo
-for dir in "$(brew --prefix rustup 2>/dev/null)/bin" "$HOME/.cargo/bin"; do
-	[ -d "$dir" ] && PATH="$dir:$PATH"
+rustup_prefix=""
+command -v brew >/dev/null 2>&1 && rustup_prefix="$(brew --prefix rustup 2>/dev/null)"
+for dir in "${rustup_prefix:+$rustup_prefix/bin}" "$HOME/.cargo/bin"; do
+	[ -n "$dir" ] && [ -d "$dir" ] && PATH="$dir:$PATH"
 done
+unset rustup_prefix
 export PATH
 
-# Theos refuses project paths that contain spaces.
+# Note: Theos refuses project paths that contain spaces (scripts/build-librespot.sh checks this).

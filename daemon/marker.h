@@ -46,6 +46,23 @@ static inline NSArray<NSDictionary *> *cb_marker_devices(id content, BOOL *legac
     return devices;
 }
 
+// Writes the marker in the current format. keep_age: when a marker exists, the new file gets its
+// modification time (a record that this process has not confirmed must not look fresh because a
+// device was added to it); a marker that does not exist yet, or keep_age NO, gets the current time.
+static inline BOOL cb_marker_write(NSString *path, NSArray<NSDictionary *> *devices, BOOL keep_age) {
+    struct stat st;
+    BOOL had = keep_age && stat(path.fileSystemRepresentation, &st) == 0;
+    if (![@{ @"devices": devices } writeToFile:path atomically:YES]) return NO;
+    if (had) {
+        struct timeval times[2] = {
+            { .tv_sec = st.st_atimespec.tv_sec, .tv_usec = (__darwin_suseconds_t)(st.st_atimespec.tv_nsec / 1000) },
+            { .tv_sec = st.st_mtimespec.tv_sec, .tv_usec = (__darwin_suseconds_t)(st.st_mtimespec.tv_nsec / 1000) },
+        };
+        utimes(path.fileSystemRepresentation, times);
+    }
+    return YES;
+}
+
 // Reads the marker at `path`. nil: no marker, or one that says nothing usable (the caller removes
 // it when `*invalid` is set). Does not crash on any content.
 static inline NSArray<NSDictionary *> *cb_marker_load(NSString *path, BOOL *stale, BOOL *migrated, BOOL *invalid) {
@@ -62,14 +79,7 @@ static inline NSArray<NSDictionary *> *cb_marker_load(NSString *path, BOOL *stal
     }
     if (stale) *stale = cb_record_stale(difftime(time(NULL), st.st_mtime));  // the original time, before any rewrite
     if (legacy || cleaned) {
-        if ([@{ @"devices": devices } writeToFile:path atomically:YES]) {
-            struct timeval times[2] = {
-                { .tv_sec = st.st_atimespec.tv_sec, .tv_usec = (__darwin_suseconds_t)(st.st_atimespec.tv_nsec / 1000) },
-                { .tv_sec = st.st_mtimespec.tv_sec, .tv_usec = (__darwin_suseconds_t)(st.st_mtimespec.tv_nsec / 1000) },
-            };
-            utimes(path.fileSystemRepresentation, times);
-            if (migrated) *migrated = YES;
-        }
+        if (cb_marker_write(path, devices, YES) && migrated) *migrated = YES;
     }
     return devices;
 }

@@ -9,6 +9,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 [[ -f "$ROOT/env.sh" ]] && source "$ROOT/env.sh"
 SRC="$ROOT/build/librespot-src"
 PIN="99b6088bf3ea028f90192676ac1a337fa4b2ed12"   # librespot 0.8.0 (dev, 2026-10-21)
+# Keep Cargo's cache outside SRC: actions/cache can restore it before the checkout exists, and a
+# restored build/librespot-src/target would make the subsequent git clone fail on a non-empty path.
+export CARGO_TARGET_DIR="$ROOT/build/cargo-target"
 
 if [[ "$ROOT" == *" "* ]]; then
 	echo "The project path must not contain spaces (Theos refuses such paths)." >&2
@@ -40,5 +43,5 @@ export IPHONEOS_DEPLOYMENT_TARGET=15.0
 ( cd "$SRC" && cargo build --release --locked --target aarch64-apple-ios \
 	--no-default-features --features "native-tls,rodio-backend,with-libmdns" )
 
-cp "$SRC/target/aarch64-apple-ios/release/librespot" "$ROOT/build/librespot"
+cp "$CARGO_TARGET_DIR/aarch64-apple-ios/release/librespot" "$ROOT/build/librespot"
 echo "built: $ROOT/build/librespot"

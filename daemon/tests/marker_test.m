@@ -95,6 +95,22 @@ int main(void) {
         cb_marker_load(p, &stale, &migrated, &invalid);
         CHECK(stale);
 
+        // Adding a device to an unconfirmed old record keeps its age; a new file, or keep_age NO, is fresh.
+        NSArray *one = @[ @{ @"uid": @"u1", @"name": @"HomePod" } ];
+        NSArray *two = @[ @{ @"uid": @"u1", @"name": @"HomePod" }, @{ @"uid": @"u2", @"name": @"Sonos" } ];
+        p = writePlist(@"keep-age", @{ @"devices": one });
+        setAge(p, 13);
+        CHECK(cb_marker_write(p, two, YES));
+        d = cb_marker_load(p, &stale, &migrated, &invalid);
+        CHECK(d.count == 2 && stale);
+        CHECK(cb_marker_write(p, one, NO));
+        d = cb_marker_load(p, &stale, &migrated, &invalid);
+        CHECK(d.count == 1 && !stale);
+        p = [gDir stringByAppendingPathComponent:@"keep-age-new"];
+        CHECK(cb_marker_write(p, one, YES));
+        cb_marker_load(p, &stale, &migrated, &invalid);
+        CHECK(!stale);
+
         [[NSFileManager defaultManager] removeItemAtPath:gDir error:nil];
     }
     if (failures) { printf("%d failure(s)\n", failures); return 1; }

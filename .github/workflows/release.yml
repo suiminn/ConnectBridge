@@ -31,6 +31,11 @@ jobs:
             exit 1
           fi
 
+      - name: Lint plists and scripts
+        run: |
+          find . -name '*.plist' -not -path './build/*' -not -path './.theos/*' -print0 | xargs -0 plutil -lint
+          for script in scripts/*.sh layout/DEBIAN/postinst layout/DEBIAN/prerm layout/DEBIAN/postrm; do bash -n "$script"; done
+
       - name: Host tests
         run: scripts/test-daemon.sh
 

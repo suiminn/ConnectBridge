@@ -62,12 +62,12 @@ plist を直接編集する場合は、`kill -HUP <connectbridged の PID>` で�
 |---|---|---|
 | `Enabled` | `true` | `false` で librespot を起動しない (デーモンは生きていて、設定アプリで戻すと起動する) |
 | `ConnectName` | (空) | Spotify のデバイス一覧に出る名前。空なら自動で `<AirPlay 機器の名前> (via <この iPhone の名前>)` |
-| `OutputDeviceName` | (空) | 出力先の AirPlay 機器の名前。空のあいだは何も起動しません。設定アプリでは、いま見つかっている機器の一覧から選びます (完全一致を優先し、なければ部分一致・大文字小文字無視) |
+| `OutputDeviceName` | (空) | 出力先の AirPlay 機器の名前。空のあいだは何も起動しません。設定アプリでは、いま見つかっている機器の一覧から選びます (完全一致を優先し、なければ部分一致・大文字小文字無視。部分一致で選んだときはログに出ます。確実に選ばせるには、一覧の名前そのままを指定してください) |
 | `ManageRoute` | `true` | Connect で選ばれている間の出力先の固定と、奪われたときの選び直し |
 | `Bitrate` | `160` | `96` / `160` / `320` |
 | `AirPlayGuard` | `true` | AirPlay が切れて音が本体スピーカーに移りそうになったら、即座に無音にして一時停止し、戻ったら再開する (再開の条件は [AirPlay ガード](#librespot-への変更) を参照) |
 | `GuardResumeSeconds` | `30` | 一時停止から、この秒数以内に AirPlay が戻れば自動で再開する (超えたら一時停止のまま) |
-| `ReleaseDelay` | `15` | Connect で選ばれなくなってからスピーカーを解放するまでの秒数 (`0` で即時) |
+| `ReleaseDelay` | `15` | Connect で選ばれなくなってからスピーカーを解放するまでの秒数 (`0` で即時、上限は `3600`) |
 | `Verbose` | `false` | `true` で librespot の詳細ログ |
 | `VolumePolling` | `false` | `true` で、ルートの音量を 250 ms ごとに読む (従来の方式)。`false` では、`outputVolume` の KVO を待って読み、通知が来なくても 5 秒ごとに安全のため確認する。設定アプリには出ません |
 
@@ -110,19 +110,20 @@ dpkg --purge  com.sui827.connectbridge   # 設定・ログ・保存されたロ�
 
 - 出力先の AirPlay 接続は `connectbridged` が生きている間だけ保たれます。落ちると スピーカーへの出力は止まり、再起動後に選び直します。
 - 音量の変化は、`AVAudioSession.outputVolume` の KVO (公開 API) で読み、通知が来なくても 5 秒ごとに確かめます。`VolumePolling` を `true` にすると、従来の 250 ms ごとのポーリングに戻ります。`AVSystemController` の通知は、有効な音声セッションがあっても届きませんでした。MediaRemote の `kMRMediaRemotePickedRouteVolumeDidChangeNotification` は iOS 15.8 では届きますが、iPadOS 18.7 では届かないため使っていません。`AVAudioSession.outputVolume` の KVO はどちらでも届くので、これを合図にしています (`docs/poc-results.md`)。
+- Siri などの短い音声セッション割り込みは、システムが再開可能と通知した場合はセッションを再有効化して再生を維持します。電話や別の再生アプリなど、再開不可の割り込みでは librespot を作り直すため、Spotify への再接続が入ります。
 - Siri の音声操作 (「次の曲」など) は、Spotify が Now Playing として再生中のときは Spotify に届きます。何も再生していないときは、Siri が操作先を自分で決めるため、Apple Music が開くことがあります。
-- 他のアプリ (Siri が開いた Apple Music など) に音声セッションを奪われると、librespot は自動で作り直されます (数秒、Spotify の一覧から一度消えます)。この回復の流れは、まだ十分には検証していません。
+- 他のアプリ (Siri が開いた Apple Music など) に音声セッションを奪われ、再開不可と通知された場合は、librespot を自動で作り直します (数秒、Spotify の一覧から一度消えます)。
 - ホストで自動テストしているのは、判断の部分 (`route_policy.h`、`marker.h`、`volume_logic.rs`、`guard_logic.rs`) だけです。MediaRemote / AVFoundation を呼ぶ部分と、librespot への結線は、実機で確かめています。
 - リリースの deb には、GitHub の build attestation が付きます (`gh attestation verify <deb> --repo <owner>/<repo>`)。`SHA256SUMS` は同じリリースにあるので、ダウンロードの破損を見つけるためのものです。
 - 非公開 API (MediaRemote / AVSystemController) を使うため、iOS のバージョンが変わると動かなくなる可能性があります。
-- `connectbridged` は起動時と librespot の起動前に、`mobile` ユーザーの `librespot` のうち、親が launchd のもの (前回のデーモンが残した子プロセス) を終了させます。自分で起動した librespot は、`/var/jb/usr/libexec/connectbridge/librespot` 以外のバイナリであれば対象になりません。
+- `connectbridged` は起動時と librespot の起動前に、`mobile` ユーザーの `librespot` のうち、親が launchd のもの (前回のデーモンが残した子プロセス) を終了させます。対象になるのは、`/var/jb/usr/libexec/connectbridge/librespot` をそのまま起動したものだけです。別のバイナリの librespot は、親が launchd でも対象になりません。
 
 ## 注意
 
 - **非公式クライアントです**: ConnectBridge は Spotify とは無関係で、公認も受けていません。Spotify の Connect の仕組みに、非公式のクライアント (librespot) として接続します。Spotify の利用規約に反する可能性があり、アカウントに対して制限などの措置が取られる可能性もあります。Premium アカウントが必要で、**自己責任**でお使いください。
-- **iOS を Linux として名乗らせる変更を含みます**: 上の「librespot への変更」のとおり、このパッケージの librespot は、Spotify のサーバーに対して iOS ではなく Linux のクライアントとして接続します。そうしないと、サーバーがログインを拒否するためです。この変更の内容は `librespot/ios-bridge.patch` にそのまま含まれています。これが問題になりうることを理解したうえで使ってください。
+- **iOS を Linux として名乗らせる変更を含みます**: 上の「librespot への変更」のとおり、このパッケージの librespot は、Spotify のサーバーに対して iOS ではなく Linux のクライアントとして接続します。そうしないと、サーバーがログインを拒否するためです。この変更の内容は `librespot/ios-bridge.patch` にそのまま含まれています。これが問題になりうること、また Spotify 側の仕様変更で動かなくなる可能性があることを理解したうえで使ってください。
 - **同名の AirPlay 機器が複数あると、出力先を自動では戻せません**: 同じ名前のスピーカーが 2 台以上見つかり、どれが現在の出力か見分けられないときは、安全のため出力先を戻さずに残します (8 回再試行して諦めます)。機器の名前を変えてください。
-- **`librespot` という名前のプロセスを止めます**: 起動時に、`mobile` ユーザーの `librespot` で親が launchd のもの (前回のデーモンが残した子プロセス) を終了します。同じ名前で `nohup` などから自分で起動したものも対象になるので、別の librespot を並行して動かさないでください。
+- **`librespot` という名前のプロセスを止めます**: 起動時に、`mobile` ユーザーの `librespot` で親が launchd のもの (前回のデーモンが残した子プロセス) を終了します。対象は、この deb が入れた `/var/jb/usr/libexec/connectbridge/librespot` を、`nohup` などから自分で起動したものまでです。それを並行して動かさないでください (別のバイナリなら対象外です)。
 - 認証情報 (`credentials.json`) はパッケージに含まれません。共有しないでください。
 - ライセンス: 本プロジェクトは MIT ライセンスです (`LICENSE`、Copyright (c) 2026 suiminn)。無保証で、使用は自己責任です。
 - 同梱するサードパーティのライセンスは `THIRD_PARTY_NOTICES` にまとめています (librespot は MIT、ほかに `symphonia` など MPL-2.0 のクレートを改変せずに含みます。ソースの入手先は同ファイルに記載)。deb の `/var/jb/usr/share/doc/com.sui827.connectbridge/` にも入ります。更新は `scripts/gen-third-party-notices.py` で行います。
@@ -133,8 +134,8 @@ dpkg --purge  com.sui827.connectbridge   # 設定・ログ・保存されたロ�
 daemon/        connectbridged (ObjC) と署名用 entitlements
 librespot/     librespot に当てるパッチ
 prefs/         設定アプリの「ConnectBridge」(Theos の設定バンドル)
-layout/        deb にそのまま入るファイル (launchd plist、postinst/prerm、既定の設定)
-scripts/       build-librespot.sh、gen-third-party-notices.py、overnight-check.sh
+layout/        deb にそのまま入るファイル (launchd plist、設定アプリの項目、postinst/prerm/postrm)
+scripts/       build-librespot.sh、test-daemon.sh (ホストのテスト)、gen-third-party-notices.py、overnight-check.sh
 docs/          仕様書 (spec.md)、PoC の手順と記録
 poc/           Phase 0 の調査ツール (audiotest / routetool / dumpclass)
 .github/       CI とリリースのワークフロー

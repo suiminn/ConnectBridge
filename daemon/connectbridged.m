@@ -264,6 +264,7 @@ static void killStrayLibrespots(void) {
     int count = proc_listallpids(NULL, 0);
     if (count <= 0) return;
     pid_t *pids = calloc((size_t)count + 16, sizeof(pid_t));
+    if (!pids) return;
     count = proc_listallpids(pids, (int)(((size_t)count + 16) * sizeof(pid_t)));
     for (int i = 0; i < count; i++) {
         pid_t pid = pids[i];
@@ -379,10 +380,20 @@ static void startLibrespot(void) {
     ];
     if ([config[@"Verbose"] boolValue]) args = [args arrayByAddingObject:@"-v"];
     char **argv = calloc(args.count + 1, sizeof(char *));
+    if (!argv) {
+        posix_spawn_file_actions_destroy(&actions);
+        posix_spawnattr_destroy(&attr);
+        cblog(@"out of memory, librespot is not started");
+        scheduleRestart();
+        return;
+    }
     for (NSUInteger i = 0; i < args.count; i++) argv[i] = strdup(args[i].UTF8String);
 
     NSMutableArray<NSString *> *env = [NSMutableArray array];
-    for (char **e = environ; *e; e++) [env addObject:[NSString stringWithUTF8String:*e]];
+    for (char **e = environ; *e; e++) {
+        NSString *entry = [NSString stringWithUTF8String:*e];  // nil for bytes that are not UTF-8
+        if (entry) [env addObject:entry];
+    }
     [env addObject:@"CB_VOLUME_BRIDGE=1"];
     [env addObject:@"CB_PASSTHROUGH_VOLUME=1"];
     [env addObject:@"CB_NOW_PLAYING=1"];
@@ -402,6 +413,15 @@ static void startLibrespot(void) {
         [env addObject:[NSString stringWithFormat:@"CB_GUARD_RESUME_SECS=%d", MAX(1, [config[@"GuardResumeSeconds"] intValue])]];
     }
     char **envp = calloc(env.count + 1, sizeof(char *));
+    if (!envp) {
+        posix_spawn_file_actions_destroy(&actions);
+        posix_spawnattr_destroy(&attr);
+        for (NSUInteger i = 0; argv[i]; i++) free(argv[i]);
+        free(argv);
+        cblog(@"out of memory, librespot is not started");
+        scheduleRestart();
+        return;
+    }
     for (NSUInteger i = 0; i < env.count; i++) envp[i] = strdup(env[i].UTF8String);
 
     pid_t pid = 0;
@@ -590,13 +610,21 @@ static void publishOutputDevices(void) {
 // Selecting an AirPlay device takes a few seconds; asking again while it is still connecting can
 // restart the connection, so a new request waits for kSelectRetryInterval.
 static const NSTimeInterval kSelectRetryInterval = 8;
+static const NSTimeInterval kSelectCallbackTimeout = 45;
 static NSDate *gLastSelect = nil;
+// setOutputDevices is asynchronous. While any selection request has not called back, the current
+// output being elsewhere is not enough to discard ownership: the request may still land later.
+static NSUInteger gSelectsInFlight = 0;
 
 // gHolding: we put the route on an output device and have not given it back yet.
 // When the Connect device is deselected the route is kept for ReleaseDelay seconds: re-selecting
 // the AirPlay device takes a few seconds, and short interruptions (a reconnect, switching to
 // another device and back) should not cost a reconnect. A new selection cancels the release.
 static BOOL gHolding = NO;
+// SIGUSR1 (the package is being removed or upgraded) released the route: it is not taken again until
+// the Connect selection changes, whatever ManageRoute says. Cleared when the selection changes.
+static BOOL gSuppressHold = NO;
+static NSDate *gSuppressSince = nil;  // when SIGUSR1 set it: it expires (see cb_suppress_expired), e.g. after an aborted upgrade
 static NSDate *gReleaseAt = nil;  // when the next release attempt is due
 
 // The devices we may have put the route on (uid and name from discovery). They are what gets
@@ -620,24 +648,41 @@ static NSDictionary *ownedEntry(MRAVOutputDevice *device) {
     return @{ @"uid": device.uid ?: @"", @"name": device.name ?: @"" };
 }
 
+static NSDate *gLastTouch = nil;  // nil: the record came from an earlier process
+// This process has seen the output on a device of the record. Only then is the marker kept fresh: a
+// record that was merely read at start (the previous daemon's) must keep its age, or an old one that
+// is not to be trusted any more would look new.
+static BOOL gOwnedConfirmed = NO;
+
+// Until the output has been seen on a device of the record, rewriting the marker (a device is added)
+// keeps its modification time, for the same reason.
 static void writeOwnership(void) {
-    if (![@{ @"devices": gOwned } writeToFile:kHoldingPath atomically:YES]) cblog(@"route: could not write %@", kHoldingPath);
+    if (!cb_marker_write(kHoldingPath, gOwned, !gOwnedConfirmed)) cblog(@"route: could not write %@", kHoldingPath);
+}
+
+// The marker's age tells how long a daemon has been gone: keep it fresh for as long as we may hold
+// the route (also while ManageRoute is off and Connect is selected: the record is still owed, and
+// a record older than the staleness limit would be dropped instead of released).
+static void touchOwnership(void) {
+    if (!gOwnedConfirmed) return;
+    if (gLastTouch && -[gLastTouch timeIntervalSinceNow] <= 600) return;  // nil: the record came from an earlier process
+    gLastTouch = [NSDate date];
+    utimes(kHoldingPath.fileSystemRepresentation, NULL);
 }
 
 // The system output is `device` now: it is the only one on record.
 static void confirmOwnership(MRAVOutputDevice *device) {
     NSDictionary *entry = ownedEntry(device);
-    static NSDate *lastTouch = nil;
+    if (!gOwnedConfirmed) {
+        gOwnedConfirmed = YES;
+        gLastTouch = nil;  // the marker may be the previous daemon's, with its age: it is current now
+    }
     if (gOwned.count == 1 && [gOwned[0] isEqual:entry]) {
-        // The marker's age tells how long a daemon has been gone: keep it fresh while we hold.
-        if (!lastTouch || -[lastTouch timeIntervalSinceNow] > 600) {  // nil: the record came from an earlier process
-            lastTouch = [NSDate date];
-            utimes(kHoldingPath.fileSystemRepresentation, NULL);
-        }
+        touchOwnership();
         return;
     }
     gOwned = @[entry];
-    lastTouch = [NSDate date];
+    gLastTouch = [NSDate date];
     writeOwnership();
 }
 
@@ -651,6 +696,8 @@ static void addPendingOwnership(MRAVOutputDevice *device) {
 
 static void forgetOwnership(void) {
     gOwned = nil;
+    gOwnedConfirmed = NO;
+    gLastTouch = nil;
     gHolding = NO;
     gReleaseAt = nil;
     unlink(kHoldingPath.fileSystemRepresentation);
@@ -678,6 +725,10 @@ static NSMutableDictionary<NSString *, NSDictionary *> *gNameWatch = nil;  // na
 static void updateDiscoveryWatch(void) {
     if (!gDiscovery || !gOwned.count) return;
     if (!gNameWatch) gNameWatch = [NSMutableDictionary dictionary];
+    NSArray *ownedNames = [gOwned valueForKey:@"name"];
+    for (NSString *key in gNameWatch.allKeys) {
+        if (![ownedNames containsObject:key]) [gNameWatch removeObjectForKey:key];  // no longer on record
+    }
     for (NSDictionary *owned in gOwned) {
         NSString *name = owned[@"name"];
         NSMutableArray *uids = [NSMutableArray array];
@@ -730,6 +781,13 @@ static void holdRoute(void) {
         noteRouteState([NSString stringWithFormat:@"\"%@\" not found", wanted]);
         return;
     }
+    // A partial match picks a device the user did not name exactly: say so (once per device).
+    static NSMutableSet<NSString *> *loggedPartial = nil;
+    if (!loggedPartial) loggedPartial = [NSMutableSet set];
+    if ([target.name caseInsensitiveCompare:wanted] != NSOrderedSame && target.uid && ![loggedPartial containsObject:target.uid]) {
+        [loggedPartial addObject:target.uid];
+        cblog(@"route: \"%@\" is not an exact match for OutputDeviceName \"%@\"; using it (set the exact name to be sure)", target.name, wanted);
+    }
     MRAVOutputContext *context = [NSClassFromString(@"MRAVOutputContext") sharedSystemAudioContext];
     cb_match current = currentOutputMatch(context, target);
     if (current == CB_MATCH_YES) {
@@ -750,9 +808,30 @@ static void holdRoute(void) {
     }
     if (current == CB_MATCH_AMBIGUOUS) cblog(@"route: \"%@\" may be the output but cannot be told from a device of the same name; not ready", target.name);
     noteRouteState([NSString stringWithFormat:@"selecting \"%@\"", target.name]);
+    __block BOOL requestDone = NO;  // set by the callback or by the watchdog, whichever comes first (both on the main queue)
+    gSelectsInFlight++;
     [context setOutputDevices:@[target] withCallbackQueue:dispatch_get_main_queue() block:^(void *error) {
         if (error) cblog(@"route: selecting \"%@\" failed", target.name);
+        if (!requestDone) {
+            requestDone = YES;
+            if (gSelectsInFlight) gSelectsInFlight--;
+        }
+        // The Connect selection may have ended (or SIGUSR1 may have suppressed holding) while the
+        // request was pending. Recheck immediately now that it can no longer land after the release.
+        if (!gSelectsInFlight && gOwned.count && (!gActive || gSuppressHold)) {
+            gReleaseAt = [NSDate date];
+        }
     }];
+    // A callback that never comes must not block the release for ever, nor take the daemon (and the
+    // Spotify session) down: stop waiting for it. The record stays until the output is seen elsewhere,
+    // and a late landing is handled like any other output change.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kSelectCallbackTimeout * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (requestDone) return;
+        requestDone = YES;
+        if (gSelectsInFlight) gSelectsInFlight--;
+        cblog(@"route: selecting \"%@\" did not call back in %.0fs; no longer waiting for it", target.name, kSelectCallbackTimeout);
+    });
 }
 
 static BOOL gReleaseInFlight = NO;
@@ -774,6 +853,33 @@ static void scheduleReleaseRetry(void) {
     }
 }
 
+// Is the system output one of the devices on record? (nil context: no.) ownedNames: the names on record.
+static cb_match ownedOutputMatch(MRAVOutputContext *context, NSString **ownedNames) {
+    NSMutableArray<NSString *> *uids = [NSMutableArray array], *names = [NSMutableArray array];
+    for (MRAVOutputDevice *current in [context outputDevices]) {
+        [uids addObject:current.uid ?: @""];
+        [names addObject:current.name ?: @""];
+    }
+    const char *uidv[uids.count + 1], *namev[names.count + 1];
+    for (NSUInteger i = 0; i < uids.count; i++) { uidv[i] = uids[i].UTF8String; namev[i] = names[i].UTF8String; }
+    cb_match match = CB_MATCH_NO;
+    NSString *names_ = nil;
+    for (NSDictionary *owned in gOwned) {
+        NSString *uid = owned[@"uid"], *name = owned[@"name"];
+        BOOL known = NO;  // does discovery know this very device?
+        size_t sameName = 0;
+        for (MRAVOutputDevice *device in [gDiscovery availableOutputDevices]) {
+            if (device.isLocalDevice) continue;
+            if ([device.name isEqual:name]) sameName++;
+            if (uid.length && [device.uid isEqual:uid]) known = YES;
+        }
+        match = cb_match_merge(match, cb_owner_match(uid.UTF8String, name.UTF8String, uidv, namev, uids.count, known, discoveryStable(name), sameName));
+        names_ = names_ ? [names_ stringByAppendingFormat:@", %@", name] : name;
+    }
+    if (ownedNames) *ownedNames = names_;
+    return match;
+}
+
 // Gives the output back to the built-in speaker, but only if the system output still is the device
 // we put it on: if somebody moved it elsewhere meanwhile, it is left alone.
 // blocking: used while exiting, when the main queue is not served any more; the result is known on
@@ -787,31 +893,12 @@ static BOOL releaseOwnedRoute(BOOL blocking) {
     loadOwnership(&stale);  // the marker's age; the content is gOwned
     MRAVOutputContext *context = mediaRemoteAvailable() ? [NSClassFromString(@"MRAVOutputContext") sharedSystemAudioContext] : nil;
 
-    NSMutableArray<NSString *> *uids = [NSMutableArray array], *names = [NSMutableArray array];
-    for (MRAVOutputDevice *current in [context outputDevices]) {
-        [uids addObject:current.uid ?: @""];
-        [names addObject:current.name ?: @""];
-    }
-    const char *uidv[uids.count + 1], *namev[names.count + 1];
-    for (NSUInteger i = 0; i < uids.count; i++) { uidv[i] = uids[i].UTF8String; namev[i] = names[i].UTF8String; }
-    cb_match match = CB_MATCH_NO;
     NSString *ownedNames = nil;
-    for (NSDictionary *owned in gOwned) {
-        NSString *uid = owned[@"uid"], *name = owned[@"name"];
-        BOOL known = NO;  // does discovery know this very device?
-        size_t sameName = 0;
-        for (MRAVOutputDevice *device in [gDiscovery availableOutputDevices]) {
-            if (device.isLocalDevice) continue;
-            if ([device.name isEqual:name]) sameName++;
-            if (uid.length && [device.uid isEqual:uid]) known = YES;
-        }
-        match = cb_match_merge(match, cb_owner_match(uid.UTF8String, name.UTF8String, uidv, namev, uids.count, known, discoveryStable(name), sameName));
-        ownedNames = ownedNames ? [ownedNames stringByAppendingFormat:@", %@", name] : name;
-    }
+    cb_match match = ownedOutputMatch(context, &ownedNames);
     MRAVOutputDevice *local = mediaRemoteAvailable() ? findOutputDevice(nil, YES) : nil;
     gRouteState = nil;
 
-    switch (cb_release_decide(mediaRemoteAvailable(), stale, match, local != nil)) {
+    switch (cb_release_decide_while_selecting(gSelectsInFlight != 0, mediaRemoteAvailable(), stale, match, local != nil)) {
         case CB_ACTION_CLEAR:
             noteRouteState(stale ? @"nothing to release (the record is old)" : @"nothing to release");
             forgetOwnership();
@@ -871,6 +958,13 @@ static void releaseLeftoverRoute(void) {
     NSArray<NSDictionary *> *record = loadOwnership(&stale);
     if (!record) return;
     NSString *names = [[record valueForKey:@"name"] componentsJoinedByString:@", "];
+    if (stale) {
+        // Too old to say the route is still ours (the user may have picked the same device since):
+        // forget it now, or a later match with the output would make it current again.
+        cblog(@"route: dropping the old holding record for \"%@\"", names);
+        unlink(kHoldingPath.fileSystemRepresentation);
+        return;
+    }
     // Whatever the settings say now: a route that was put on the device is given back (the release
     // only touches the output while it still is that device).
     gOwned = record;
@@ -899,11 +993,20 @@ static void routeTick(void) {
         rotateDaemonLog();
         rotateLibrespotLog(gChild != 0);
     }
-    NSTimeInterval delay = MAX(0, [config[@"ReleaseDelay"] doubleValue]);
+    NSTimeInterval delay = MIN(MAX(0, [config[@"ReleaseDelay"] doubleValue]), 3600);  // an hour at most: the record would age out
     BOOL active = readActive();
+
+    // SIGUSR1 came from a package removal or upgrade; if the service is still here a while later, that
+    // was aborted: follow ManageRoute again.
+    if (gSuppressHold && cb_suppress_expired(-[gSuppressSince timeIntervalSinceNow])) {
+        cblog(@"route: the service was not stopped after SIGUSR1; holding follows ManageRoute again");
+        gSuppressHold = NO;
+        gSuppressSince = nil;
+    }
 
     if (active != gActive) {
         gActive = active;
+        gSuppressHold = NO;
         publishState(active ? @"active" : @"inactive");
         if (active) {
             cblog(@"connect: selected on this device");
@@ -927,7 +1030,7 @@ static void routeTick(void) {
 
     // The setting can change without this tick having seen the selection change (the restart that follows
     // a change may be over within one tick): while Connect is selected, holding follows ManageRoute.
-    if (gActive && manage != gHolding) {
+    if (gActive && !gSuppressHold && manage != gHolding) {
         if (manage) {
             cblog(@"route: ManageRoute is on, holding the route");
             gReleaseAt = nil;
@@ -942,12 +1045,39 @@ static void routeTick(void) {
         }
     }
 
+    if (gActive && gOwned.count) {
+        // A record read at start has not been seen on the output by this process. With ManageRoute off
+        // holdRoute never does, so look at the output here: once it is on a device of the record, the
+        // record is ours to keep fresh (else a long selection would age it past the staleness limit and
+        // the release at the end would drop it without moving the output).
+        static NSDate *lastLook = nil;
+        if (!gOwnedConfirmed && mediaRemoteAvailable() && (!lastLook || -[lastLook timeIntervalSinceNow] > 5)) {
+            lastLook = [NSDate date];
+            MRAVOutputContext *context = [NSClassFromString(@"MRAVOutputContext") sharedSystemAudioContext];
+            if (ownedOutputMatch(context, NULL) == CB_MATCH_YES) {
+                gOwnedConfirmed = YES;
+                gLastTouch = nil;  // see confirmOwnership
+            }
+        }
+        touchOwnership();
+    } else if (gOwned.count && (gReleaseAt || gReleaseInFlight)) {
+        // Connect is not selected any more but the release is still to come (a long ReleaseDelay, or
+        // retries): the record is still owed, and must not age past the staleness limit meanwhile,
+        // or the release would drop it without moving the output.
+        touchOwnership();
+    }
+
+    // SIGUSR1 turns holding off, but an earlier asynchronous selection may only just have finished.
+    // Its route still has to be released while the package manager waits for the marker to disappear.
+    if (gReleaseAt && [gReleaseAt timeIntervalSinceNow] <= 0 && !gReleaseInFlight && (!gActive || gSuppressHold)) {
+        gReleaseAt = nil;
+        BOOL done = releaseOwnedRoute(gSuppressHold);  // package removal: finish before launchctl unload
+        if (!done && gSuppressHold && gOwned.count) gReleaseAt = [NSDate dateWithTimeIntervalSinceNow:1];
+        return;
+    }
     if (!gHolding) return;
     if (gActive) {
         holdRoute();
-    } else if (gReleaseAt && [gReleaseAt timeIntervalSinceNow] <= 0 && !gReleaseInFlight) {
-        gReleaseAt = nil;
-        releaseOwnedRoute(NO);
     }
 }
 
@@ -1039,10 +1169,15 @@ int main(int argc, char **argv) {
             // otherwise routeTick selects the device again (it may only just have been discovered,
             // or a failed release leaves gHolding on) before the service is unloaded.
             gHolding = NO;
+            gSuppressHold = YES;
+            gSuppressSince = [NSDate date];  // routeTick follows ManageRoute while Connect is selected: not this time
             gReleaseAt = nil;
             gReleaseInFlight = NO;
             gReleaseGeneration++;  // the result of an unfinished release is ignored
-            if (gOwned) releaseOwnedRoute(YES);  // on failure the record stays and the next start retries
+            if (gOwned) {
+                releaseOwnedRoute(YES);  // on failure the record stays; a pending selection is retried below
+                if (gOwned) gReleaseAt = [NSDate date];
+            }
         });
         installSignalHandler(SIGHUP, ^{
             cblog(@"SIGHUP: restarting librespot with the current preferences");

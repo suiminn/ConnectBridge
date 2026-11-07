@@ -39,6 +39,14 @@ int main(void) {
     CHECK(cb_release_decide(true, false, CB_MATCH_NO, true) == CB_ACTION_CLEAR);
     CHECK(cb_release_decide(true, false, CB_MATCH_NO, false) == CB_ACTION_CLEAR);  // even if discovery is not ready
 
+    // A selection request may still put the output on the recorded device after this snapshot. Do
+    // not clear the record until its callback has arrived; then the ordinary evidence decides.
+    CHECK(cb_release_decide_while_selecting(true, true, false, CB_MATCH_NO, true) == CB_ACTION_RETRY);
+    CHECK(cb_release_decide_while_selecting(false, true, false, CB_MATCH_NO, true) == CB_ACTION_CLEAR);
+
+    CHECK(!cb_suppress_expired(7));
+    CHECK(cb_suppress_expired(CB_SUPPRESS_HOLD_SECONDS));
+
     // The system reports no output at all: that does not say the route moved. Keep the record.
     CHECK(cb_owner_match("uid-A", "HomePod A", NULL, NULL, 0, true, true, 1) == CB_MATCH_UNKNOWN);
     CHECK(cb_release_decide(true, false, CB_MATCH_UNKNOWN, true) == CB_ACTION_RETRY);

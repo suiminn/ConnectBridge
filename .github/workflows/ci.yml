@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Rust
-        run: rustup toolchain install stable --profile minimal --target aarch64-apple-ios --no-self-update && rustup default stable
+        run: rustup toolchain install 1.99.1 --profile minimal --target aarch64-apple-ios --no-self-update && rustup default 1.99.1  # pinned: raise it on purpose, together with a local build
 
       - name: Lint plists and scripts
         run: |
