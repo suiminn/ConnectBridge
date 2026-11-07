@@ -4,7 +4,6 @@
 #   daemon/marker.h         the "holding" marker file
 #   src/volume_logic.rs     volume sync state machine (from librespot/ios-bridge.patch)
 #   src/guard_logic.rs      the route guard's pause record (same)
-#   src/notif_check.rs      polling vs. volume notification comparison (same)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -39,7 +38,3 @@ rustc --edition 2021 --test -o "$OUT/volume_logic_test" "$OUT/rust/src/volume_lo
 ( cd "$OUT/rust" && git apply --include='src/guard_logic.rs' "$ROOT/librespot/ios-bridge.patch" )
 rustc --edition 2021 --test -o "$OUT/guard_logic_test" "$OUT/rust/src/guard_logic.rs"
 "$OUT/guard_logic_test" --quiet
-
-( cd "$OUT/rust" && git apply --include='src/notif_check.rs' "$ROOT/librespot/ios-bridge.patch" )
-rustc --edition 2021 --test -o "$OUT/notif_check_test" "$OUT/rust/src/notif_check.rs"
-"$OUT/notif_check_test" --quiet

@@ -389,9 +389,6 @@ static void startLibrespot(void) {
     // The route volume is read when the system says it changed (KVO of outputVolume), not every 250 ms
     // (VolumePolling brings the polling back).
     if (![config[@"VolumePolling"] boolValue]) [env addObject:@"CB_VOLUME_NOTIFY=1"];
-    // Observation only: compares the volume polling with the outputVolume KVO
-    // (docs/poc-results.md). Remove it together with notif_check.rs once that is decided.
-    [env addObject:@"CB_VOLUME_NOTIF_CHECK=1"];
     if (![config[@"Verbose"] boolValue]) {
         // Track titles are logged at info level by librespot_playback::player; keep them out of the
         // log unless Verbose is on. libmdns warns about every interface it cannot send on.

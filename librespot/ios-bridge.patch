@@ -749,10 +749,10 @@ index 0000000..64a136d
 +        }];
 +}
 diff --git a/src/main.rs b/src/main.rs
-index 03cd358..bd2e206 100644
+index 03cd358..22c6c6a 100644
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -39,6 +39,13 @@ use tokio::sync::Semaphore;
+@@ -39,6 +39,12 @@ use tokio::sync::Semaphore;
  use url::Url;
  
  mod player_event_handler;
@@ -761,12 +761,11 @@ index 03cd358..bd2e206 100644
 +mod session_state;
 +mod now_playing;
 +mod volume_bridge;
-+mod notif_check;
 +mod volume_logic;
  use player_event_handler::{EventHandler, run_program_on_sink_events};
  
  fn device_id(name: &str) -> String {
-@@ -1907,11 +1914,75 @@ async fn set_env_var<K: AsRef<OsStr>, V: AsRef<OsStr>>(key: K, value: V) {
+@@ -1907,11 +1913,75 @@ async fn set_env_var<K: AsRef<OsStr>, V: AsRef<OsStr>>(key: K, value: V) {
      drop(permit);
  }
  
@@ -842,7 +841,7 @@ index 03cd358..bd2e206 100644
      const DISCOVERY_RETRY_UPTIME_LIMIT: Duration = Duration::from_secs(60);
      const RECONNECT_RATE_LIMIT: usize = 5;
  
-@@ -1919,7 +1990,36 @@ async fn main() {
+@@ -1919,7 +1989,36 @@ async fn main() {
          set_env_var(RUST_BACKTRACE, "full").await;
      }
  
@@ -879,7 +878,7 @@ index 03cd358..bd2e206 100644
  
      let mut last_credentials = None;
      let mut spirc: Option<Spirc> = None;
-@@ -2042,6 +2142,24 @@ async fn main() {
+@@ -2042,6 +2141,24 @@ async fn main() {
          (backend)(device, format)
      });
  
@@ -904,7 +903,7 @@ index 03cd358..bd2e206 100644
      if let Some(player_event_program) = setup.player_event_program.clone() {
          _event_handler = Some(EventHandler::new(
              player.get_player_event_channel(),
-@@ -2055,8 +2173,65 @@ async fn main() {
+@@ -2055,8 +2172,65 @@ async fn main() {
          }
      }
  
@@ -970,7 +969,7 @@ index 03cd358..bd2e206 100644
              credentials = async {
                  match discovery.as_mut() {
                      Some(d) => d.next().await,
-@@ -2122,6 +2297,12 @@ async fn main() {
+@@ -2122,6 +2296,12 @@ async fn main() {
  
                  warn!("Spirc shut down unexpectedly");
  
@@ -983,243 +982,6 @@ index 03cd358..bd2e206 100644
                  let mut reconnect_exceeds_rate_limit = || {
                      auto_connect_times.retain(|&t| t.elapsed() < RECONNECT_RATE_LIMIT_WINDOW);
                      auto_connect_times.len() > RECONNECT_RATE_LIMIT
-diff --git a/src/notif_check.rs b/src/notif_check.rs
-new file mode 100644
-index 0000000..35fc9bc
---- /dev/null
-+++ b/src/notif_check.rs
-@@ -0,0 +1,231 @@
-+//! connectbridge: compares the system volume polling with the KVO of `AVAudioSession.outputVolume`,
-+//! without any platform calls, so that it
-+//! can be tested on a Mac (`scripts/test-daemon.sh` runs the tests below with `rustc --test`).
-+//!
-+//! Observation only: nothing here changes what the volume bridge does. It answers whether the
-+//! notification could replace the polling: every change that the polling sees should come with a
-+//! notification (`missed` otherwise), and every notification with a change (`extra` otherwise).
-+//! A change and a notification belong together when they are less than `WINDOW_MS` apart; the
-+//! notification may come before the poll sees the change (up to one poll interval) or after it.
-+
-+#![allow(dead_code)]
-+
-+use std::collections::VecDeque;
-+
-+/// How far apart a change seen by the polling and its notification may be.
-+pub const WINDOW_MS: u64 = 1000;
-+/// Resolved entries are kept this long, for the entries on the other side that still need them.
-+const KEEP_MS: u64 = 4 * WINDOW_MS;
-+/// The volume is a float that the system rounds; smaller differences are not a change.
-+const TOLERANCE: f32 = 0.0005;
-+
-+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-+pub enum Verdict {
-+    /// The polling saw a change at this time and no notification came.
-+    Missed(u64),
-+    /// A notification came at this time and the polling saw no change.
-+    Extra(u64),
-+}
-+
-+struct Entry {
-+    at: u64,
-+    resolved: bool,
-+}
-+
-+#[derive(Default)]
-+pub struct NotifCheck {
-+    last_raw: Option<f32>,
-+    changes: VecDeque<Entry>,
-+    notifs: VecDeque<Entry>,
-+    pub changes_seen: u64,
-+    pub notifs_seen: u64,
-+    pub missed: u64,
-+    pub extra: u64,
-+}
-+
-+impl NotifCheck {
-+    pub const fn new() -> Self {
-+        NotifCheck {
-+            last_raw: None,
-+            changes: VecDeque::new(),
-+            notifs: VecDeque::new(),
-+            changes_seen: 0,
-+            notifs_seen: 0,
-+            missed: 0,
-+            extra: 0,
-+        }
-+    }
-+
-+    pub fn on_notification(&mut self, now_ms: u64) {
-+        self.notifs_seen += 1;
-+        self.notifs.push_back(Entry { at: now_ms, resolved: false });
-+    }
-+
-+    /// One reading of the system volume (`None`: it could not be read).
-+    pub fn on_sample(&mut self, now_ms: u64, raw: Option<f32>) {
-+        let Some(raw) = raw.filter(|v| *v >= 0.0) else {
-+            self.last_raw = None; // unreadable: the next reading is a new start, not a change
-+            return;
-+        };
-+        if self.last_raw.is_some_and(|last| (raw - last).abs() > TOLERANCE) {
-+            self.changes_seen += 1;
-+            self.changes.push_back(Entry { at: now_ms, resolved: false });
-+        }
-+        self.last_raw = Some(raw);
-+    }
-+
-+    /// The volume cannot be compared now (the route is not the wanted one, or has only just become
-+    /// so): forget the last reading and everything not yet decided. Changes and notifications that
-+    /// come with a route switch are not the notification's doing.
-+    pub fn pause(&mut self) {
-+        self.last_raw = None;
-+        self.changes.clear();
-+        self.notifs.clear();
-+    }
-+
-+    /// Decides what is old enough to be decided; call it after every sample.
-+    pub fn tick(&mut self, now_ms: u64) -> Vec<Verdict> {
-+        let mut verdicts = Vec::new();
-+        let near = |a: u64, b: u64| a.abs_diff(b) <= WINDOW_MS;
-+        for c in self.changes.iter_mut().filter(|c| !c.resolved && now_ms >= c.at + WINDOW_MS) {
-+            c.resolved = true;
-+            if !self.notifs.iter().any(|n| near(n.at, c.at)) {
-+                self.missed += 1;
-+                verdicts.push(Verdict::Missed(c.at));
-+            }
-+        }
-+        for n in self.notifs.iter_mut().filter(|n| !n.resolved && now_ms >= n.at + WINDOW_MS) {
-+            n.resolved = true;
-+            if !self.changes.iter().any(|c| near(n.at, c.at)) {
-+                self.extra += 1;
-+                verdicts.push(Verdict::Extra(n.at));
-+            }
-+        }
-+        while self.changes.front().is_some_and(|c| c.resolved && now_ms >= c.at + KEEP_MS) {
-+            self.changes.pop_front();
-+        }
-+        while self.notifs.front().is_some_and(|n| n.resolved && now_ms >= n.at + KEEP_MS) {
-+            self.notifs.pop_front();
-+        }
-+        verdicts
-+    }
-+}
-+
-+#[cfg(test)]
-+mod tests {
-+    use super::*;
-+
-+    /// Samples the volume every 250 ms from `from` to `to`; the volume steps to `v` at `step_at`.
-+    fn run(check: &mut NotifCheck, from: u64, to: u64, step_at: Option<(u64, f32)>, start: f32) -> Vec<Verdict> {
-+        let mut out = Vec::new();
-+        let mut t = from;
-+        while t <= to {
-+            let v = match step_at {
-+                Some((at, v)) if t >= at => v,
-+                _ => start,
-+            };
-+            check.on_sample(t, Some(v));
-+            out.extend(check.tick(t));
-+            t += 250;
-+        }
-+        out
-+    }
-+
-+    #[test]
-+    fn change_with_a_notification_just_before_is_covered() {
-+        let mut c = NotifCheck::new();
-+        c.on_notification(5_000); // the poll sees the change up to one interval later
-+        let out = run(&mut c, 0, 8_000, Some((5_100, 0.4)), 0.3);
-+        assert!(out.is_empty());
-+        assert_eq!((c.changes_seen, c.notifs_seen, c.missed, c.extra), (1, 1, 0, 0));
-+    }
-+
-+    #[test]
-+    fn change_with_a_notification_just_after_is_covered() {
-+        let mut c = NotifCheck::new();
-+        let mut out = run(&mut c, 0, 5_250, Some((5_000, 0.4)), 0.3);
-+        c.on_notification(5_300);
-+        out.extend(run(&mut c, 5_500, 9_000, Some((5_000, 0.4)), 0.3));
-+        assert!(out.is_empty());
-+        assert_eq!((c.missed, c.extra), (0, 0));
-+    }
-+
-+    #[test]
-+    fn change_without_a_notification_is_missed() {
-+        let mut c = NotifCheck::new();
-+        let out = run(&mut c, 0, 8_000, Some((5_000, 0.4)), 0.3);
-+        assert_eq!(out, vec![Verdict::Missed(5_000)]);
-+        assert_eq!(c.missed, 1);
-+    }
-+
-+    #[test]
-+    fn notification_without_a_change_is_extra() {
-+        let mut c = NotifCheck::new();
-+        c.on_notification(5_000);
-+        let out = run(&mut c, 0, 8_000, None, 0.3);
-+        assert_eq!(out, vec![Verdict::Extra(5_000)]);
-+        assert_eq!(c.extra, 1);
-+    }
-+
-+    #[test]
-+    fn a_notification_far_from_the_change_does_not_cover_it() {
-+        let mut c = NotifCheck::new();
-+        c.on_notification(1_000);
-+        let out = run(&mut c, 0, 12_000, Some((6_000, 0.4)), 0.3);
-+        assert!(out.contains(&Verdict::Missed(6_000)));
-+        assert!(out.contains(&Verdict::Extra(1_000)));
-+    }
-+
-+    #[test]
-+    fn several_steps_and_several_notifications() {
-+        let mut c = NotifCheck::new();
-+        let mut t = 0;
-+        let mut v = 0.3;
-+        let mut out = Vec::new();
-+        while t <= 20_000 {
-+            if t == 4_000 || t == 4_500 || t == 9_000 {
-+                v += 0.05;
-+                c.on_notification(t);
-+            }
-+            c.on_sample(t, Some(v));
-+            out.extend(c.tick(t));
-+            t += 250;
-+        }
-+        assert!(out.is_empty());
-+        assert_eq!((c.changes_seen, c.notifs_seen), (3, 3));
-+    }
-+
-+    #[test]
-+    fn small_differences_and_unreadable_samples_are_not_changes() {
-+        let mut c = NotifCheck::new();
-+        c.on_sample(0, Some(0.3));
-+        c.on_sample(250, Some(0.3002));
-+        c.on_sample(500, None);
-+        c.on_sample(750, Some(0.9)); // after an unreadable reading: a start, not a change
-+        c.on_sample(1_000, Some(-1.0));
-+        assert_eq!(c.changes_seen, 0);
-+        assert!(c.tick(10_000).is_empty());
-+    }
-+
-+    #[test]
-+    fn pause_forgets_undecided_entries_and_the_last_reading() {
-+        let mut c = NotifCheck::new();
-+        c.on_sample(0, Some(0.3));
-+        c.on_notification(100);
-+        c.pause(); // route switch: the notification and the jump of the volume mean nothing
-+        c.on_sample(250, Some(0.8)); // first reading after the pause is a start, not a change
-+        assert!(c.tick(10_000).is_empty());
-+        assert_eq!((c.missed, c.extra), (0, 0));
-+    }
-+
-+    #[test]
-+    fn resolved_entries_are_dropped_after_a_while() {
-+        let mut c = NotifCheck::new();
-+        c.on_notification(0);
-+        c.on_sample(0, Some(0.3));
-+        c.on_sample(250, Some(0.4));
-+        c.tick(2_000);
-+        c.tick(20_000);
-+        assert!(c.changes.is_empty() && c.notifs.is_empty());
-+    }
-+}
 diff --git a/src/now_playing.rs b/src/now_playing.rs
 new file mode 100644
 index 0000000..fd7eea6
@@ -1623,10 +1385,10 @@ index 0000000..bde1f66
 +}
 diff --git a/src/volume_bridge.rs b/src/volume_bridge.rs
 new file mode 100644
-index 0000000..2aacbf9
+index 0000000..82a2012
 --- /dev/null
 +++ b/src/volume_bridge.rs
-@@ -0,0 +1,277 @@
+@@ -0,0 +1,214 @@
 +//! connectbridge: keeps the Spotify Connect volume and the output route (HomePod) volume in sync.
 +//!
 +//! Connect -> route: every `VolumeChanged` player event is applied to the system volume.
@@ -1646,10 +1408,7 @@ index 0000000..2aacbf9
 +
 +#[cfg(target_os = "ios")]
 +mod imp {
-+    use crate::{
-+        notif_check::{NotifCheck, Verdict},
-+        volume_logic::VolumeLogic,
-+    };
++    use crate::volume_logic::VolumeLogic;
 +    use std::{
 +        sync::{
 +            Mutex, OnceLock,
@@ -1664,13 +1423,6 @@ index 0000000..2aacbf9
 +        fn cb_watch_volume_notifications(callback: extern "C" fn(f32));
 +    }
 +
-+    // CB_VOLUME_NOTIF_CHECK: compare the polling with the outputVolume KVO (observation
-+    // only, see notif_check.rs). Its own lock: the notification arrives on another thread.
-+    static CHECK: Mutex<NotifCheck> = Mutex::new(NotifCheck::new());
-+    /// (time, counters) of the last summary line: it is written when the counters changed, at most this often.
-+    static LAST_SUMMARY: Mutex<(u64, [u64; 4])> = Mutex::new((0, [0; 4]));
-+    const SUMMARY_EVERY_MS: u64 = 30 * 1000;
-+
 +    /// CB_VOLUME_NOTIFY: no polling of the route volume. It is read when the system says it changed (KVO of outputVolume)
 +    /// (`NOTIFIED`) or when `VolumeLogic::needs_poll` says a look is due. Without the variable the
 +    /// volume is polled on every tick, as before.
@@ -1681,16 +1433,11 @@ index 0000000..2aacbf9
 +        *ON.get_or_init(|| std::env::var_os("CB_VOLUME_NOTIFY").is_some())
 +    }
 +
-+    fn check_enabled() -> bool {
-+        static ON: OnceLock<bool> = OnceLock::new();
-+        *ON.get_or_init(|| std::env::var_os("CB_VOLUME_NOTIF_CHECK").is_some())
-+    }
-+
-+    /// Starts listening once, if either mode needs the notification.
++    /// Starts listening once (notify mode only).
 +    fn start_notifications() {
 +        static STARTED: OnceLock<()> = OnceLock::new();
 +        STARTED.get_or_init(|| {
-+            if notify_mode() || check_enabled() {
++            if notify_mode() {
 +                unsafe { cb_watch_volume_notifications(on_volume_notification) };
 +            }
 +        });
@@ -1699,54 +1446,6 @@ index 0000000..2aacbf9
 +    /// KVO of AVAudioSession.outputVolume: the route volume changed (it may fire more than once for one change).
 +    extern "C" fn on_volume_notification(_volume: f32) {
 +        NOTIFIED.store(true, Ordering::Release);
-+        if check_enabled() {
-+            CHECK.lock().unwrap().on_notification(now_ms());
-+        }
-+    }
-+
-+    /// The check starts this long after the route became ready: the system volume (and its
-+    /// notification) follows the output with a delay.
-+    const CHECK_SETTLE_MS: u64 = 2_000;
-+    static CHECK_READY_SINCE: Mutex<Option<u64>> = Mutex::new(None);
-+
-+    /// Called on every poll tick; `ready`: the wanted device is the output.
-+    fn check_sample(ready: bool) {
-+        start_notifications();
-+        if !check_enabled() {
-+            return;
-+        }
-+        let now = now_ms();
-+        let since = {
-+            let mut s = CHECK_READY_SINCE.lock().unwrap();
-+            if !ready {
-+                *s = None;
-+            } else if s.is_none() {
-+                *s = Some(now);
-+            }
-+            *s
-+        };
-+        if since.is_none_or(|t| now < t + CHECK_SETTLE_MS) {
-+            CHECK.lock().unwrap().pause();
-+            return;
-+        }
-+        let raw = unsafe { cb_get_system_volume() };
-+        let mut check = CHECK.lock().unwrap();
-+        check.on_sample(now, Some(raw));
-+        for verdict in check.tick(now) {
-+            match verdict {
-+                Verdict::Missed(at) => log::warn!("volume check: MISSED a change seen by the polling at {at} ms, no notification came"),
-+                Verdict::Extra(at) => log::warn!("volume check: EXTRA notification at {at} ms, the polling saw no change"),
-+            }
-+        }
-+        let counters = [check.changes_seen, check.notifs_seen, check.missed, check.extra];
-+        let mut last = LAST_SUMMARY.lock().unwrap();
-+        if counters != last.1 && now >= last.0 + SUMMARY_EVERY_MS {
-+            *last = (now, counters);
-+            log::info!(
-+                "volume check: changes={} notifications={} missed={} extra={}",
-+                counters[0], counters[1], counters[2], counters[3]
-+            );
-+        }
 +    }
 +
 +    /// "ready" must have held this long: the system volume follows the output with a delay.
@@ -1853,9 +1552,9 @@ index 0000000..2aacbf9
 +
 +    /// Route -> Connect. Returns the volume to send to Spirc; tell `sent` how it went.
 +    pub fn poll_external() -> Option<u16> {
++        start_notifications();
 +        with_bridge(|b| {
 +            let ready = route_ready(b);
-+            check_sample(ready);
 +            let now = now_ms();
 +            // A notification is only taken when the route is ready: the volume of another route
 +            // (the built-in speaker) means nothing, and the logic forgets everything meanwhile.

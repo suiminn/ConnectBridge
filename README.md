@@ -109,7 +109,7 @@ dpkg --purge  com.sui827.connectbridge   # 設定・ログ・保存されたロ�
 ## 既知の制限
 
 - 出力先の AirPlay 接続は `connectbridged` が生きている間だけ保たれます。落ちると スピーカーへの出力は止まり、再起動後に選び直します。
-- 音量の変化は、`AVAudioSession.outputVolume` の KVO (公開 API) で読み、通知が来なくても 5 秒ごとに確かめます。`VolumePolling` を `true` にすると、従来の 250 ms ごとのポーリングに戻ります。観察用に、ポーリングと通知を突き合わせるコード (`CB_VOLUME_NOTIF_CHECK`) がまだ動いていて、KVO が安定したと確認できたら消す予定です。`AVSystemController` の通知は、有効な音声セッションがあっても届きませんでした。MediaRemote の `kMRMediaRemotePickedRouteVolumeDidChangeNotification` は iOS 15.8 では届きますが、iPadOS 18.7 では届かないため使っていません。`AVAudioSession.outputVolume` の KVO はどちらでも届くので、これを合図にしています (`docs/poc-results.md`)。
+- 音量の変化は、`AVAudioSession.outputVolume` の KVO (公開 API) で読み、通知が来なくても 5 秒ごとに確かめます。`VolumePolling` を `true` にすると、従来の 250 ms ごとのポーリングに戻ります。`AVSystemController` の通知は、有効な音声セッションがあっても届きませんでした。MediaRemote の `kMRMediaRemotePickedRouteVolumeDidChangeNotification` は iOS 15.8 では届きますが、iPadOS 18.7 では届かないため使っていません。`AVAudioSession.outputVolume` の KVO はどちらでも届くので、これを合図にしています (`docs/poc-results.md`)。
 - Siri の音声操作 (「次の曲」など) は、Spotify が Now Playing として再生中のときは Spotify に届きます。何も再生していないときは、Siri が操作先を自分で決めるため、Apple Music が開くことがあります。
 - 他のアプリ (Siri が開いた Apple Music など) に音声セッションを奪われると、librespot は自動で作り直されます (数秒、Spotify の一覧から一度消えます)。この回復の流れは、まだ十分には検証していません。
 - ホストで自動テストしているのは、判断の部分 (`route_policy.h`、`marker.h`、`volume_logic.rs`、`guard_logic.rs`) だけです。MediaRemote / AVFoundation を呼ぶ部分と、librespot への結線は、実機で確かめています。

@@ -116,7 +116,7 @@ Theos 側は Makefile の `<name>_CODESIGN_FLAGS = -Sent.plist` で付けられ�
 - 注意: HomePod 本体と iPhone のボタンのどちらの操作かは、通知から区別していない。変化の刻みが 0.05 と 0.0625 の 2 種類あり、どちらにも通知が来た。
 
 ### Step 4 続き: librespot の中での比較 (2026-11-05)
-- `CB_VOLUME_NOTIF_CHECK=1` (connectbridged が付ける) で、librespot が通知を受け、250 ms のポーリングが見つけた変化と突き合わせる (観察のみで、動作は変えない。`notif_check.rs`)。変化と通知は、前後 1 秒以内なら対応しているとみなす。
+- `CB_VOLUME_NOTIF_CHECK=1` (connectbridged が付ける) で、librespot が通知を受け、250 ms のポーリングが見つけた変化と突き合わせる (観察のみで、動作は変えない。KVO が安定したと確認できたので、このコードは削除した)。変化と通知は、前後 1 秒以内なら対応しているとみなす。
 - 実機 (iPhone 7 + HomePod mini): iPhone の音量ボタン、HomePod 本体の操作、コントロールセンターでの出力切り替え (iPhone 本体 → HomePod) を試して、変化 11 回に通知 11 回、取りこぼし 0、余分 0。
 - 残り: 一晩のあとも通知が届くか (`docs/overnight-test.md` の手順 4)。
 
