@@ -1,6 +1,6 @@
 Package: com.sui827.connectbridge
 Name: ConnectBridge
-Version: 0.1.0
+Version: 0.1.0~beta1
 Architecture: iphoneos-arm64
 Description: Spotify Connect to AirPlay bridge
  Makes the iPhone a Spotify Connect device that plays on an AirPlay speaker (HomePod).
