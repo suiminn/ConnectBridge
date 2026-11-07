@@ -11,7 +11,7 @@ Spotify アプリ ── Spotify Connect ──▶ [iPhone: librespot] ── Ai
                                           ▲  音量の双方向同期  ▲
 ```
 
-- 動作確認した環境: (1) iPhone 7 / iOS 15.8.4 / Dopamine 系 rootless (`/var/jb`) / HomePod mini 1 台。Sonos Era 100 でも再生と Spotify 側の音量操作が効きました。(2) iPad (第 7 世代) / iPadOS 18.7 / palera1n rootless / HomePod mini: 再生、出力の選択、HomePod 側の音量変更の検出と、一晩の放置まで確認しました (route の解放、AirPlay が切れたときのガードは未確認)。ほかの機種・iOS・スピーカーは未確認です (rootful は非対応)
+- 動作確認した環境: (1) iPhone 7 / iOS 15.8.4 / Dopamine 系 rootless (`/var/jb`) / HomePod mini 1 台。Sonos Era 100 でも再生と Spotify 側の音量操作が効きました。(2) iPad (第 7 世代) / iPadOS 18.7 / palera1n rootless / HomePod mini: 再生、出力の選択、HomePod 側の音量変更の検出、一晩の放置、AirPlay が切れたときのガード (一晩で 3 回の切断を自動で止めて再開) まで確認しました。route の解放は未確認です。長時間放置したあとに一度だけ接続できないことがあり (原因はたぶん Spotify との接続が切れたまま再接続が遅れる librespot の動き)、現在は接続が切れたら librespot を作り直して対処しています。ほかの機種・iOS・スピーカーは未確認です (rootful は非対応)。HomePod のステレオペア (グループ) での動作は確かめておらず、対象外です
 - 要件: Spotify Premium、iPhone と AirPlay スピーカーが同じ Wi-Fi にいること、PreferenceLoader (設定アプリの項目のため。deb の依存に入っています)
 
 > **はじめに必ず「[注意](#注意)」を読んでください。** 非公式の Spotify クライアントを使うため、Spotify の利用規約に反する可能性があり、自己責任での利用になります。
@@ -65,7 +65,7 @@ plist を直接編集する場合は、`kill -HUP <connectbridged の PID>` で�
 | `OutputDeviceName` | (空) | 出力先の AirPlay 機器の名前。空のあいだは何も起動しません。設定アプリでは、いま見つかっている機器の一覧から選びます (完全一致を優先し、なければ部分一致・大文字小文字無視) |
 | `ManageRoute` | `true` | Connect で選ばれている間の出力先の固定と、奪われたときの選び直し |
 | `Bitrate` | `160` | `96` / `160` / `320` |
-| `AirPlayGuard` | `true` | AirPlay が切れて音が本体スピーカーに移りそうになったら、即座に無音にして一時停止し、戻ったら再開する |
+| `AirPlayGuard` | `true` | AirPlay が切れて音が本体スピーカーに移りそうになったら、即座に無音にして一時停止し、戻ったら再開する (再開の条件は [AirPlay ガード](#librespot-への変更) を参照) |
 | `GuardResumeSeconds` | `30` | 一時停止から、この秒数以内に AirPlay が戻れば自動で再開する (超えたら一時停止のまま) |
 | `ReleaseDelay` | `15` | Connect で選ばれなくなってからスピーカーを解放するまでの秒数 (`0` で即時) |
 | `Verbose` | `false` | `true` で librespot の詳細ログ |
@@ -87,7 +87,9 @@ tail -f /var/mobile/Library/ConnectBridge/librespot.log   # librespot
 - **OS を `linux` と名乗る**: iOS のままだと、AP の認証・login5・OAuth が拒否されます (issue #1477)。Android に対して upstream がすでに行っているのと同種の処置です。
 - **AVAudioSession を有効化**: cpal は iOS でセッションを設定せず、そのままだと無音になります。
 - **音量ブリッジ** (`CB_VOLUME_BRIDGE`, `CB_PASSTHROUGH_VOLUME`): Connect の音量値を音声に掛けず、出力先のシステム音量に適用します。逆方向は `outputVolume` の KVO で変化を知り (取りこぼし対策に 5 秒ごとの確認つき)、Connect に送ります (ループ防止つき)。
-- **AirPlay ガード** (`CB_REQUIRE_AIRPLAY`): 選択中に出力が本体スピーカー (または受話口) に移ったら、ソフトミキサーの無音フラグで即座に音を止め、一時停止します。AirPlay に戻ったら、設定した秒数以内なら自動で再開します。接続の張り直しは `connectbridged` が行います。
+- **AirPlay ガード** (`CB_REQUIRE_AIRPLAY`): 選択中に出力が本体スピーカー (または受話口) に移ったら、ソフトミキサーの無音フラグで即座に音を止め、一時停止します。AirPlay に戻ったら、`GuardResumeSeconds` 以内なら自動で再開します。ただし、一時停止のあいだに人が操作した場合 (iPhone 側の一時停止/再生、別の Spotify 端末での一時停止) は再開しません。キューの終わりやエラーによる停止も、安全側に倒して再開しません。接続の張り直しは `connectbridged` が行います。
+- **接続が切れたら librespot を作り直す**: Spotify との接続が切れて 5 秒たっても戻らないとき (または Spirc が予期せず終わったとき) は、librespot が終了コード 75 で終了し、`connectbridged` が 2 秒後に新しいプロセスを起動します。Spotify の一覧から数秒だけ消えます。librespot 内の再接続は、遅れて長時間つながらないことがあったため使っていません。
+- **IPv6 の mDNS を使わない** (libmdns のパッチ): iOS では IPv6 の multicast 送信が `No route to host` で失敗し続けるため、IPv4 だけで見つけてもらいます。IPv6 だけのネットワークでは、ローカルでの発見はできません。
 - **Now Playing とリモートコマンド** (`CB_NOW_PLAYING`): 曲名・アーティスト・アルバム・ジャケット・再生位置をシステムの Now Playing に送り、再生/一時停止/次/前/シークのコマンドを Spirc に渡します。MediaPlayer はメインスレッドで run loop が回っていないと動かないため、iOS では tokio のランタイムを別スレッドに移し、メインスレッドを run loop に譲っています。
 
 ## ログとプライバシー
@@ -107,7 +109,7 @@ dpkg --purge  com.sui827.connectbridge   # 設定・ログ・保存されたロ�
 ## 既知の制限
 
 - 出力先の AirPlay 接続は `connectbridged` が生きている間だけ保たれます。落ちると スピーカーへの出力は止まり、再起動後に選び直します。
-- 音量の変化は、`AVAudioSession.outputVolume` の KVO (公開 API) を待って読みます。`VolumePolling` を `true` にすると、従来の 250 ms ごとのポーリングに戻ります。まだ試験中です (観察用に、ポーリングとの突き合わせも動いています)。`AVSystemController` の通知は、有効な音声セッションがあっても届きませんでした。MediaRemote の `kMRMediaRemotePickedRouteVolumeDidChangeNotification` は iOS 15.8 では届きますが、iPadOS 18.7 では届かないため使っていません。`AVAudioSession.outputVolume` の KVO はどちらでも届くので、これを合図にしています。route 切り替え時などに取りこぼさない保証がないため、ポーリングは残しています (`docs/poc-results.md`)。
+- 音量の変化は、`AVAudioSession.outputVolume` の KVO (公開 API) で読み、通知が来なくても 5 秒ごとに確かめます。`VolumePolling` を `true` にすると、従来の 250 ms ごとのポーリングに戻ります。観察用に、ポーリングと通知を突き合わせるコード (`CB_VOLUME_NOTIF_CHECK`) がまだ動いていて、KVO が安定したと確認できたら消す予定です。`AVSystemController` の通知は、有効な音声セッションがあっても届きませんでした。MediaRemote の `kMRMediaRemotePickedRouteVolumeDidChangeNotification` は iOS 15.8 では届きますが、iPadOS 18.7 では届かないため使っていません。`AVAudioSession.outputVolume` の KVO はどちらでも届くので、これを合図にしています (`docs/poc-results.md`)。
 - Siri の音声操作 (「次の曲」など) は、Spotify が Now Playing として再生中のときは Spotify に届きます。何も再生していないときは、Siri が操作先を自分で決めるため、Apple Music が開くことがあります。
 - 他のアプリ (Siri が開いた Apple Music など) に音声セッションを奪われると、librespot は自動で作り直されます (数秒、Spotify の一覧から一度消えます)。この回復の流れは、まだ十分には検証していません。
 - ホストで自動テストしているのは、判断の部分 (`route_policy.h`、`marker.h`、`volume_logic.rs`、`guard_logic.rs`) だけです。MediaRemote / AVFoundation を呼ぶ部分と、librespot への結線は、実機で確かめています。
